@@ -150,23 +150,6 @@ export {
   isSystemRunContext,
   projectSystemRunContext,
 } from './SystemRunContext.js';
-// 工具管道公开面收窄登记（L5-P47 / I45，待决事项②未答复前只登记、不改导出）：
-// 这里只再导出部分默认中间件，缺 toolArgumentBoundsGate、runtimeSafetyGate、producerSubmitOnlyGate、
-// evidenceCapture，用这些构件自行组装的管道比默认管道宽松；需要同等安全的管道时只用
-// createToolPipeline()。progressEmitter、eventBusPublisher 不在默认装配且宿主零引用。
-// ②确认收窄后只保留 createToolPipeline 与类型并同步 config/agent-public-api-signatures.json。
-// observationRecord 已随缓存层删除（W1-04，决定①）撤回，签名快照 ./runtime 69→68。
-export {
-  allowlistGate,
-  analystVerifyOnlyGate,
-  createToolPipeline,
-  deterministicDuplicateGuard,
-  eventBusPublisher,
-  evolutionDecisionGate,
-  progressEmitter,
-  recordRepairOnlyGate,
-  submitDedup,
-  ToolExecutionPipeline,
-  traceRecord,
-  trackerSignal,
-} from './ToolExecutionPipeline.js';
+// 工具管道只公开默认工厂与类（W2a-01，决定②）：单个中间件拼出的管道比默认链宽松，
+// 8 个默认中间件的 ./runtime 再导出与 progressEmitter/eventBusPublisher 已撤回，签名快照 ./runtime 68→58。
+export { createToolPipeline, ToolExecutionPipeline } from './ToolExecutionPipeline.js';

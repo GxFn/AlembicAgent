@@ -66,7 +66,7 @@ Adapter 的 explain、执行前检查、获得队列执行位置后的检查使�
 
 接入该新能力端口后，宿主准入拒绝在 handler 前返回 `TOOL_ACTION_DENIED` 或 `TOOL_UNAVAILABLE`，带 `writeState: 'not-started'`、`requiresReadback: false` 和 blocked 状态。未声明可用性的旧宿主保留 handler 错误路径。执行后的 Core 回执和异常继续原样归一化，不能用这类“未开始”标记覆盖已经发生的写入。
 
-可选 `progressEmitter` / `eventBusPublisher` 中间件与 tracker 共用完整回执的成功判定：blocked、aborted、timeout、error、needs-confirmation 或 `ok: false` 均报告失败，即使 payload 中仍有部分读回数据。`ok: true` 的可用 partial 回执保持成功，业务 payload 和原始 envelope 均保留。这两种通知中间件需显式安装；默认 Runtime 仍通过自身事件路径通知宿主。
+工具管道的 tracker 观察使用完整回执的成功判定：blocked、aborted、timeout、error、needs-confirmation 或 `ok: false` 均记为失败，即使 payload 中仍有部分读回数据。`ok: true` 的可用 partial 回执保持成功，业务 payload 和原始 envelope 均保留。工具事件只由 Runtime 自身的事件路径通知宿主，管道不提供通知中间件。
 
 Handler 的 `_meta.resultStatus` 可显式给出终态，Adapter 优先保留它。终端中断继续保留部分输出与兼容 `ok: true`，消费者必须同时检查 `status`：已取消信号为 aborted，信号明确携带 TimeoutError 为 timeout。旧 sandbox 的 137 还可能来自输出配额强杀；原因不明时为 error，并附 `terminal_execution_interrupted`，不能据部分输出判定命令成功。已经取得的中断输出不再进入无用的压缩调用。
 

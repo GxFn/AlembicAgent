@@ -11,6 +11,8 @@ import type {
 
 /** blocked 结果被包装为失败 payload 时记录的诊断码。 */
 const TOOL_BLOCKED_RESULT_NORMALIZED = 'TOOL_BLOCKED_RESULT_NORMALIZED';
+/** 非 blocked 短路跳过执行器、但中间件没有声明缓存命中时的日志码。 */
+const TOOL_SHORT_CIRCUIT_NOT_COUNTED_AS_CACHE_HIT = 'TOOL_SHORT_CIRCUIT_NOT_COUNTED_AS_CACHE_HIT';
 
 interface ToolPipelineResultState {
   result: unknown;
@@ -50,15 +52,15 @@ function diagnosticReason(result: unknown) {
   return 'blocked';
 }
 
-/** 宿主日志器失败（同步抛错或异步拒绝）不能让已确定的 blocked 结果变成执行失败。 */
-function warnSafely(context: ToolPipelineContext, message: string): void {
+/** 宿主日志器失败（同步抛错或异步拒绝）不能让已确定的短路结果变成执行失败。 */
+function logSafely(context: ToolPipelineContext, level: 'info' | 'warn', message: string): void {
   try {
-    const pending: unknown = context.runtime.logger?.warn(message);
+    const pending: unknown = context.runtime.logger?.[level](message);
     if (pending && typeof (pending as { then?: unknown }).then === 'function') {
       void Promise.resolve(pending).catch(() => undefined);
     }
   } catch (err: unknown) {
-    // 日志只是诊断旁路；吞掉宿主日志器异常，blocked 结果本身已经归一完成。
+    // 日志只是诊断旁路；吞掉宿主日志器异常，短路结果本身已经确定。
     void err;
   }
 }
@@ -99,7 +101,7 @@ function normalizeBlockedResult<Context extends ToolPipelineContext>(
   if (context.loopCtx.diagnostics) {
     context.loopCtx.diagnostics.warn(warning);
   } else {
-    warnSafely(context, `[ToolPipeline] ${warning.code}: ${warning.message}`);
+    logSafely(context, 'warn', `[ToolPipeline] ${warning.code}: ${warning.message}`);
   }
   return normalized;
 }
@@ -124,8 +126,19 @@ async function runBeforeMiddlewares<Context extends ToolPipelineContext>(
       };
     }
     if (verdict?.result !== undefined) {
-      // 非 blocked 短路目前仍隐式记为缓存命中（公开语义）；改由短路中间件自行声明依赖待决事项②。
-      metadata.cacheHit = true;
+      // L5-P19（决定②）：非 blocked 短路只表示跳过执行器，engine 不再隐式置 cacheHit；
+      // 是否算缓存命中由短路中间件自行写 metadata.cacheHit/duplicateShortCircuit 声明。
+      if (!metadata.cacheHit) {
+        // 未声明命中的短路留日志，便于区分“复用缓存”与“自定义跳过执行”，效率统计不计命中。
+        const resultKind = verdict.result === null ? 'null' : typeof verdict.result;
+        logSafely(
+          context,
+          'info',
+          `[ToolPipeline] ${TOOL_SHORT_CIRCUIT_NOT_COUNTED_AS_CACHE_HIT}: Middleware "${mw.name}" ` +
+            `short-circuited ${call.name} with a non-blocked ${resultKind} result; executor skipped, ` +
+            'cacheHit=false because the middleware did not declare metadata.cacheHit.'
+        );
+      }
       return { result: verdict.result, hasResult: true };
     }
   }

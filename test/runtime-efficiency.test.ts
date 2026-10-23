@@ -16,7 +16,6 @@ import {
   AgentRuntime,
   createToolPipeline,
   DiagnosticsCollector,
-  recordRepairOnlyGate,
   resolveLlmInputStageProfile,
   ToolExecutionPipeline,
 } from '../src/agent/runtime/index.js';
@@ -29,13 +28,16 @@ import {
   projectLlmOutput,
   projectSemanticNudgeEvent,
 } from '../src/agent/runtime/processEvents.js';
+// 单个中间件不再从 ./runtime 再导出（W2a-01 / L5-P47），仓库内测试从入口模块取实现。
 import {
-  eventBusPublisher,
-  progressEmitter,
+  recordRepairOnlyGate,
   submitDedup,
   trackerSignal,
 } from '../src/agent/runtime/ToolExecutionPipeline.js';
-import { takeToolPipelineFailure } from '../src/agent/runtime/toolPipeline/engine.js';
+import {
+  executeToolPipeline,
+  takeToolPipelineFailure,
+} from '../src/agent/runtime/toolPipeline/engine.js';
 import { createToolReceipt, projectToolReceipt } from '../src/agent/runtime/toolReceipt.js';
 import { readToolObservation } from '../src/agent/utils/toolOutcomes.js';
 import type { ToolCallRequest, ToolCapabilityManifest, ToolResultEnvelope } from '../src/index.js';
@@ -174,14 +176,12 @@ describe('tool pipeline lifecycle', () => {
     { label: 'error', status: 'error', ok: false, success: false },
     { label: 'needs confirmation', status: 'needs-confirmation', ok: false, success: false },
     { label: 'timeout despite ok flag', status: 'timeout', ok: true, success: false },
-  ] as const)('reports $label consistently to optional observers without losing the payload', async ({
+  ] as const)('reports $label consistently to the tracker observer without losing the payload', async ({
     status,
     ok,
     success,
   }) => {
     const payload = { output: 'available readback' };
-    const emitProgress = vi.fn();
-    const publish = vi.fn();
     const runtime = createRuntime(createManifest(), async (request) => ({
       ...createEnvelope(request, 1),
       ok,
@@ -189,60 +189,55 @@ describe('tool pipeline lifecycle', () => {
       text: 'host result details',
       structuredContent: payload,
     }));
-    // 只替代通知端口；真实 pipeline/bridge 负责 envelope 和 metadata 的投影。
-    Object.assign(runtime, { emitProgress, bus: { publish } });
+    const loopCtx = createLoopContext(new DiagnosticsCollector());
+    // 只替代 tracker 端口；真实 pipeline/bridge 负责 envelope 和 metadata 的投影。
+    // 可选通知中间件已删除（W2a-01）；tracker 观察者按完整回执判定成功，失败时 payload 收进 data。
+    const recordToolCall = vi.fn(() => ({ isNew: true }));
+    loopCtx.tracker = { recordToolCall } as never;
+    const call = { id: 'read', name: 'code', args: { action: 'read' } };
     const result = await new ToolExecutionPipeline()
-      .use(progressEmitter)
-      .use(eventBusPublisher)
-      .execute(
-        { id: 'read', name: 'code', args: { action: 'read' } },
-        { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
-      );
+      .use(trackerSignal)
+      .execute(call, { runtime, loopCtx, iteration: 1 });
 
     expect(result.result).toBe(payload);
     expect(result.metadata.envelope).toMatchObject({ ok, status, structuredContent: payload });
-    expect(emitProgress).toHaveBeenCalledWith('tool_end', {
-      tool: 'code',
-      duration: result.metadata.durationMs,
-      status: success ? 'ok' : 'error',
-      error: success ? undefined : 'host result details',
-    });
-    expect(publish).toHaveBeenCalledWith(
-      'tool:call:end',
-      { agentId: runtime.id, tool: 'code', durationMs: result.metadata.durationMs, success },
-      { source: runtime.id }
+    expect(recordToolCall).toHaveBeenCalledTimes(1);
+    expect(recordToolCall).toHaveBeenCalledWith(
+      'code',
+      call.args,
+      success ? payload : { ok: false, status, data: payload }
+    );
+    // tracker 的判定与 AgentRuntime 回执判定一致。
+    expect(readToolObservation(createToolReceipt(call, result.result, result.metadata)).ok).toBe(
+      success
     );
   });
 
-  it('reports a metadata-only blocked verdict as failure to optional observers', async () => {
-    const execute = vi.fn();
-    const emitProgress = vi.fn();
-    const publish = vi.fn();
+  it('wraps a success-shaped blocked verdict as a failure payload in the engine (I44)', async () => {
+    const executor = vi.fn();
+    const after = vi.fn();
+    const diagnostics = new DiagnosticsCollector();
     const payload = { retained: 'readback instruction' };
-    const runtime = createRuntime(createManifest(), execute);
-    Object.assign(runtime, { emitProgress, bus: { publish } });
-    const result = await new ToolExecutionPipeline()
-      .use({ name: 'blocked', before: () => ({ blocked: true, result: payload }) })
-      .use(progressEmitter)
-      .use(eventBusPublisher)
-      .execute(
-        { id: 'read', name: 'code', args: { action: 'read' } },
-        { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
-      );
+    const call = { id: 'read', name: 'code', args: { action: 'read' } };
+    const result = await executeToolPipeline(
+      [{ name: 'blocked', before: () => ({ blocked: true, result: payload }), after }],
+      call,
+      {
+        runtime: createRuntime(createManifest(), vi.fn()),
+        loopCtx: createLoopContext(diagnostics),
+        iteration: 1,
+      },
+      executor
+    );
 
-    expect(execute).not.toHaveBeenCalled();
+    expect(executor).not.toHaveBeenCalled();
     // I44：成功形的 blocked 结果被 engine 包装为失败 payload，原对象只保留在 data 里（身份不变）。
     expect(result.result).toEqual({ error: 'blocked', status: 'blocked', data: payload });
     expect((result.result as { data?: unknown }).data).toBe(payload);
-    expect(emitProgress).toHaveBeenCalledWith(
-      'tool_end',
-      expect.objectContaining({ status: 'error' })
-    );
-    expect(publish).toHaveBeenCalledWith(
-      'tool:call:end',
-      expect.objectContaining({ success: false }),
-      { source: runtime.id }
-    );
+    expect(result.metadata).toMatchObject({ blocked: true, cacheHit: false });
+    // after 观察者拿到的是同一份已归一的失败结果。
+    expect(after).toHaveBeenCalledWith(call, result.result, expect.anything(), result.metadata);
+    expect(diagnostics.toJSON().efficiency).toMatchObject({ toolCalls: 1, cacheHits: 0 });
   });
 
   it('makes the runtime receipt and PCV read a success-shaped blocked verdict as failure', async () => {
@@ -453,12 +448,15 @@ describe('tool pipeline lifecycle', () => {
     const after = vi.fn();
     const laterBefore = vi.fn();
     const runtime = createRuntime(createManifest(), execute);
+    const info = vi.fn();
+    Object.assign(runtime, { logger: { info, warn: () => undefined } });
+    const diagnostics = new DiagnosticsCollector();
     const pipeline = new ToolExecutionPipeline()
       .use({ name: 'stop', before: () => verdict, after })
       .use({ name: 'later', before: laterBefore, after });
     const result = await pipeline.execute(
       { id: 'read', name: 'code', args: {} },
-      { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+      { runtime, loopCtx: createLoopContext(diagnostics), iteration: 1 }
     );
     expect(execute).not.toHaveBeenCalled();
     expect(laterBefore).not.toHaveBeenCalled();
@@ -477,8 +475,83 @@ describe('tool pipeline lifecycle', () => {
       expect.anything(),
       result.metadata
     );
-    // 非 blocked 短路仍隐式记为缓存命中：删除该语义依赖待决事项②，本包暂不改。
-    expect(result.metadata).toMatchObject({ blocked, cacheHit: !blocked });
+    // L5-P19（决定②）：短路只表示跳过执行器，engine 不再隐式记缓存命中；
+    // 是否算命中由短路中间件自行声明（见下一个用例）。
+    expect(result.metadata).toMatchObject({ blocked, cacheHit: false });
+    expect(diagnostics.toJSON().efficiency).toMatchObject({
+      toolCalls: 1,
+      cacheHits: 0,
+      duplicateToolCalls: 0,
+    });
+    if (blocked) {
+      expect(info).not.toHaveBeenCalled();
+    } else {
+      // 未声明命中的非 blocked 短路留一条日志：看得出哪个中间件跳过了执行器、为何不计命中。
+      expect(info).toHaveBeenCalledTimes(1);
+      expect(info).toHaveBeenCalledWith(
+        expect.stringContaining('TOOL_SHORT_CIRCUIT_NOT_COUNTED_AS_CACHE_HIT')
+      );
+      expect(info).toHaveBeenCalledWith(expect.stringContaining('Middleware "stop"'));
+    }
+  });
+  it('keeps an undeclared short-circuit result when the runtime logger throws', async () => {
+    const runtime = createRuntime(createManifest(), vi.fn());
+    Object.assign(runtime, {
+      logger: {
+        info: () => {
+          throw new Error('logger down');
+        },
+        warn: () => undefined,
+      },
+    });
+    const result = await new ToolExecutionPipeline()
+      .use({ name: 'stop', before: () => ({ result: 'kept' }) })
+      .execute(
+        { id: 'read', name: 'code', args: {} },
+        { runtime, loopCtx: createLoopContext(new DiagnosticsCollector()), iteration: 1 }
+      );
+    expect(result.result).toBe('kept');
+    expect(result.metadata.cacheHit).toBe(false);
+  });
+  it('counts a non-blocked short circuit as a cache hit only when the middleware declares it', async () => {
+    const execute = vi.fn();
+    const after = vi.fn();
+    const runtime = createRuntime(createManifest(), execute);
+    const diagnostics = new DiagnosticsCollector();
+    const cached = { reused: true };
+    const info = vi.fn();
+    Object.assign(runtime, { logger: { info, warn: () => undefined } });
+    const result = await new ToolExecutionPipeline()
+      .use({
+        name: 'selfDeclaredCache',
+        before: (_call, _ctx, metadata) => {
+          // 自定义缓存中间件自行写 cacheHit，与 deterministicDuplicateGuard 的做法一致。
+          metadata.cacheHit = true;
+          return { result: cached };
+        },
+        after,
+      })
+      .execute(
+        { id: 'read', name: 'code', args: {} },
+        { runtime, loopCtx: createLoopContext(diagnostics), iteration: 1 }
+      );
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(result.result).toBe(cached);
+    expect(result.metadata).toMatchObject({ blocked: false, cacheHit: true });
+    expect(after).toHaveBeenCalledWith(
+      expect.anything(),
+      cached,
+      expect.anything(),
+      result.metadata
+    );
+    // 自行声明命中的短路不需要“未计命中”日志。
+    expect(info).not.toHaveBeenCalled();
+    expect(diagnostics.toJSON().efficiency).toMatchObject({
+      toolCalls: 1,
+      cacheHits: 1,
+      duplicateToolCalls: 0,
+    });
   });
   it.each([
     'before',

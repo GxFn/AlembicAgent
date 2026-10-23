@@ -949,8 +949,8 @@
       ]
     },
     "./runtime": {
-      "exportCount": 68,
-      "signatureHash": "9995611ffe1332da577e34137e9f4c5ecc5e396d10ab2375e73e9e9cc01e4956",
+      "exportCount": 58,
+      "signatureHash": "d2d7bafaed81bc80ab4690306efd5fd0bd1e7f7b321be9a57d4879e7c5c442d4",
       "entries": [
         {
           "name": "AGENT_INTERFACE_CONTRACT_REQUIRED_BRANCHES",
@@ -1057,14 +1057,6 @@
           "kind": "class"
         },
         {
-          "name": "allowlistGate",
-          "kind": "object"
-        },
-        {
-          "name": "analystVerifyOnlyGate",
-          "kind": "object"
-        },
-        {
           "name": "buildLlmInputAssembly",
           "kind": "function"
         },
@@ -1109,20 +1101,8 @@
           "kind": "function"
         },
         {
-          "name": "deterministicDuplicateGuard",
-          "kind": "object"
-        },
-        {
           "name": "estimatePromptTokens",
           "kind": "function"
-        },
-        {
-          "name": "eventBusPublisher",
-          "kind": "object"
-        },
-        {
-          "name": "evolutionDecisionGate",
-          "kind": "object"
         },
         {
           "name": "expandSystemRunContext",
@@ -1165,10 +1145,6 @@
           "kind": "function"
         },
         {
-          "name": "progressEmitter",
-          "kind": "object"
-        },
-        {
           "name": "projectSystemRunContext",
           "kind": "function"
         },
@@ -1189,10 +1165,6 @@
           "kind": "function"
         },
         {
-          "name": "recordRepairOnlyGate",
-          "kind": "object"
-        },
-        {
           "name": "registerDefaultHooks",
           "kind": "function"
         },
@@ -1205,20 +1177,8 @@
           "kind": "function"
         },
         {
-          "name": "submitDedup",
-          "kind": "object"
-        },
-        {
           "name": "supportsAgentRuntimeRoute",
           "kind": "function"
-        },
-        {
-          "name": "traceRecord",
-          "kind": "object"
-        },
-        {
-          "name": "trackerSignal",
-          "kind": "object"
         },
         {
           "name": "validateAgentInterfaceContract",

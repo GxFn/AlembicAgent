@@ -1,6 +1,6 @@
 # 工具执行管道：职责与依赖
 
-`AgentRuntime` 通过 `createToolPipeline()` 运行工具。`ToolExecutionPipeline.ts` 保留公开 class、注册方法、默认装配和原有具名导出；实际职责按模块放在 `runtime/toolPipeline/`，包的公开入口未增加。
+`AgentRuntime` 通过 `createToolPipeline()` 运行工具。`ToolExecutionPipeline.ts` 保留公开 class、注册方法和默认装配；实际职责按模块放在 `runtime/toolPipeline/`。`@alembic/agent/runtime` 只公开 `createToolPipeline` 与 `ToolExecutionPipeline` 两个管道入口，单个中间件不再从包入口导出。
 
 ## 文件职责
 
@@ -14,7 +14,7 @@
 | `toolPipeline/accessGates.ts` | capability 白名单、参数大小、Runtime SafetyPolicy 与命令约束 | 执行工具或存储结果 |
 | `toolPipeline/phaseGates.ts` | Evolution、record repair、Analyst VERIFY、Producer 的动作范围 | 宿主传输和结果记账 |
 | `toolPipeline/duplicateCache.ts` | 绑定 snapshot 和策略的只读结果复用 | 可变状态读取、副作用、失败结果缓存 |
-| `toolPipeline/observations.ts` | 证据采集、memory/tracker/trace 观察和可选事件 | 工具调度、提交内容验证 |
+| `toolPipeline/observations.ts` | 证据采集、tracker/trace 观察 | 工具调度、提交内容验证、宿主事件通知 |
 | `toolPipeline/submissionLedger.ts` | 对真实持久化候选登记覆盖信息 | 创建候选、AI 修复、权限决策 |
 
 Core 继续拥有确定性知识生产能力；工具 handler 继续拥有具体工具动作。管道不复制这两层的实现。
@@ -23,16 +23,15 @@ Core 继续拥有确定性知识生产能力；工具 handler 继续拥有具体
 
 默认 before 顺序是：allowlist → 参数大小 → Runtime safety → Evolution → record repair → Analyst VERIFY → Producer → snapshot cache。之后调用宿主路由。
 
-默认 after 顺序是：snapshot cache → evidence → memory observation → tracker → trace → submission ledger。缓存保留采集标注前的结果；随后证据注入 envelope，memory 和 trace 看到同一份带标注结果，tracker 的 isNew 再传给 trace。
+默认 after 顺序是：snapshot cache → evidence → tracker → trace → submission ledger。缓存保留采集标注前的结果；随后证据注入 envelope，trace 看到带标注的结果，tracker 的 isNew 再传给 trace。
 
 - `before` 返回 `blocked: true` 会阻止后续 before 与宿主调用。
-- 显式 `result` 同样短路，`null`、`false`、`0`、空字符串都是有效结果；`undefined` 表示继续。兼容接口会为结果短路标记 `cacheHit`，实际 snapshot 复用另外标记 `duplicateShortCircuit`。
+- 显式 `result` 同样短路，`null`、`false`、`0`、空字符串都是有效结果；`undefined` 表示继续。非 blocked 的短路只表示跳过宿主调用，引擎不会把它记为缓存命中；是否算命中由短路中间件自己写 `metadata.cacheHit` 声明（snapshot 复用还会写 `duplicateShortCircuit`）。未声明命中的短路会留一条 `TOOL_SHORT_CIRCUIT_NOT_COUNTED_AS_CACHE_HIT` 日志。
 - 短路后仍按注册正序执行所有 after。这里不是 onion middleware 的逆序回卷。
 - 自定义 before/after 抛错继续向上传播；不会为了统计完整而吞掉安全门禁异常。需要容错的证据采集在自身边界处理并记录降级。
 - 宿主执行抛错或返回非 Error 拒绝值，由 bridge 归一化为明确 error。失败不进入 duplicate cache；下一次相同调用重新触达宿主，成功后才允许复用。这不是引擎自动重试。
-- `progressEmitter` 和 `eventBusPublisher` 保持可选，未加入默认链。Runtime 在结果格式化后发送默认事件，避免重复通知。
 
-`new ToolExecutionPipeline()` 仍用于显式自定义组装；需要仓库默认控制门和观察链时使用 `createToolPipeline()`。
+`new ToolExecutionPipeline()` 仍用于显式自定义组装，但只能装入调用方自己的中间件；仓库内置的控制门和观察者不再单独公开，需要它们时使用 `createToolPipeline()`。工具事件只由 Runtime 在结果格式化后发送，管道不提供通知中间件。
 
 ## 类型与共享身份
 

@@ -9,6 +9,8 @@ import * as domain from '../src/agent/domain/index.js';
 import * as profiles from '../src/agent/profiles/index.js';
 import * as prompts from '../src/agent/prompts/index.js';
 import * as runtime from '../src/agent/runtime/index.js';
+import * as toolPipelineEntry from '../src/agent/runtime/ToolExecutionPipeline.js';
+import * as toolPipelineObservations from '../src/agent/runtime/toolPipeline/observations.js';
 import * as service from '../src/agent/service/index.js';
 import * as tasks from '../src/agent/tasks/index.js';
 import { PROVIDER_CONFIGS } from '../src/ai/registry/ProviderConfig.js';
@@ -1629,17 +1631,47 @@ describe('tasks subpath retirement route (L8-P16)', () => {
   });
 });
 
-describe('runtime subpath after the cache layer removal (W1-04 / L6-P26)', () => {
-  it('drops observationRecord from ./runtime and keeps names, kinds and hash equal to the snapshot', () => {
+/**
+ * W2a-01（L5-P47 / I45，决定②）从 ./runtime 撤回的 10 个工具管道构件。8 个中间件的实现仍由
+ * createToolPipeline 装配；progressEmitter、eventBusPublisher 不在默认装配，实现一并删除。
+ */
+const WITHDRAWN_RUNTIME_PIPELINE_BINDINGS = [
+  'allowlistGate',
+  'analystVerifyOnlyGate',
+  'deterministicDuplicateGuard',
+  'eventBusPublisher',
+  'evolutionDecisionGate',
+  'progressEmitter',
+  'recordRepairOnlyGate',
+  'submitDedup',
+  'traceRecord',
+  'trackerSignal',
+] as const;
+
+describe('runtime subpath after the tool pipeline export narrowing (W2a-01 / L5-P47)', () => {
+  it('withdraws the ten pipeline building blocks and keeps names, kinds and hash equal to the snapshot', () => {
     const exported = runtime as Record<string, unknown>;
+    // observationRecord 已随缓存层删除（W1-04），继续守护不回流。
     expect('observationRecord' in exported).toBe(false);
+    for (const name of WITHDRAWN_RUNTIME_PIPELINE_BINDINGS) {
+      expect({ name, exported: name in exported }).toEqual({ name, exported: false });
+    }
+    // 公开的工具管道入口只剩默认工厂与类（宿主只导入 createToolPipeline，公开消费者夹具用类）。
+    expect(typeof runtime.createToolPipeline).toBe('function');
+    expect(runtimeKind(runtime.ToolExecutionPipeline)).toBe('class');
     const entries = Object.keys(exported)
       .sort()
       .map((name) => ({ name, kind: runtimeKind(exported[name]) }));
     const expected = snapshotEntries('./runtime');
-    // 快照与实际导出逐项一致；只删除了 observationRecord 一个运行时绑定（69 → 68）。
-    expect(expected.exportCount).toBe(68);
-    expect(expected.entries.map((entry) => entry.name)).not.toContain('observationRecord');
+    // 快照与实际导出逐项一致；本包删除 10 个运行时绑定（68 → 58）。
+    expect(expected.exportCount).toBe(58);
+    const snapshotNames = expected.entries.map((entry) => entry.name);
+    for (const name of [...WITHDRAWN_RUNTIME_PIPELINE_BINDINGS, 'observationRecord']) {
+      expect({ name, inSnapshot: snapshotNames.includes(name) }).toEqual({
+        name,
+        inSnapshot: false,
+      });
+    }
     expect(entries).toEqual(expected.entries);
     expect(entries).toHaveLength(expected.exportCount);
     expect(createHash('sha256').update(JSON.stringify(entries)).digest('hex')).toBe(
@@ -1647,12 +1679,45 @@ describe('runtime subpath after the cache layer removal (W1-04 / L6-P26)', () =>
     );
   });
 
-  it('records 450 runtime bindings across the 15 stable package exports', () => {
+  it('records 440 runtime bindings across the 15 stable package exports', () => {
     const signatures = readRepoJson('config/agent-public-api-signatures.json');
     const all = signatures.stableExportSignatures as Record<string, { exportCount: number }>;
     expect(Object.keys(all)).toHaveLength(15);
     expect(signatures.packageExportCount).toBe(15);
     const total = Object.values(all).reduce((sum, entry) => sum + entry.exportCount, 0);
-    expect(total).toBe(450);
+    expect(total).toBe(440);
+  });
+
+  it('deletes the two optional event middlewares while the internal entry keeps the eight default ones', () => {
+    const entry = toolPipelineEntry as Record<string, unknown>;
+    const observations = toolPipelineObservations as Record<string, unknown>;
+    for (const name of ['progressEmitter', 'eventBusPublisher']) {
+      expect({ name, entry: name in entry, observations: name in observations }).toEqual({
+        name,
+        entry: false,
+        observations: false,
+      });
+    }
+    // 8 个默认中间件只撤回 ./runtime 再导出，实现仍可由仓库内测试从入口模块取得。
+    for (const name of WITHDRAWN_RUNTIME_PIPELINE_BINDINGS.filter(
+      (item) => item !== 'progressEmitter' && item !== 'eventBusPublisher'
+    )) {
+      expect({ name, kind: typeof entry[name] }).toEqual({ name, kind: 'object' });
+    }
+  });
+
+  it('drops the unread toolCalls pick from ToolLoopPort (compiler probe)', () => {
+    // tsconfig 只含 src、vitest 不做类型检查，类型收窄必须用真实编译器判定。
+    const diagnostics = typecheckRouterContractProbes({
+      '__tool-loop-port-probe__.ts': [
+        "import type { ToolLoopPort } from '../src/agent/runtime/toolPipeline/contracts.js';",
+        'type Keys = keyof ToolLoopPort;',
+        "export const toolCallsPicked: 'toolCalls' extends Keys ? 'still-picked' : 'narrowed' = 'narrowed';",
+        "export const tracePicked: 'trace' extends Keys ? 'picked' : 'missing' = 'picked';",
+        "export const trackerPicked: 'tracker' extends Keys ? 'picked' : 'missing' = 'picked';",
+        '',
+      ].join('\n'),
+    });
+    expect(diagnostics['__tool-loop-port-probe__.ts']).toEqual([]);
   });
 });

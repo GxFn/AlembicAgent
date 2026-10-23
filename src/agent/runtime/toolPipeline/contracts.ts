@@ -42,7 +42,6 @@ export type ToolLoopPort = Partial<Pick<LoopContext, 'resourceScope' | 'toolSche
     | 'memoryCoordinator'
     | 'sharedState'
     | 'source'
-    | 'toolCalls'
     | 'trace'
     | 'tracker'
   >;
@@ -61,7 +60,16 @@ export interface ToolExecContext {
 export interface ToolMetadata extends RuntimeToolMetadata {
   cacheKey?: string;
 }
-/** before 钩子返回值 */
+/**
+ * before 钩子返回值。
+ *
+ * - `blocked: true`：阻止后续 before 与执行器；engine 会把成功形或缺失的 result 归一为失败 payload（I44）。
+ * - 非 blocked 且 `result !== undefined`：只表示跳过执行器，用该值作为本次结果（null/0/false/'' 都有效）。
+ *   engine 不再把它隐式记为缓存命中（L5-P19，决定②）；是否算命中由短路中间件自行写
+ *   `metadata.cacheHit`（真实快照复用另写 `metadata.duplicateShortCircuit`）声明，
+ *   deterministicDuplicateGuard 就是这样做的。未声明时 engine 只记一条日志说明未计入命中。
+ * - 返回 undefined 或 `result === undefined`：继续下一个 before。
+ */
 export interface BeforeVerdict {
   blocked?: boolean;
   result?: unknown;
