@@ -690,17 +690,9 @@ describe('evolution gate receipt contracts', () => {
     });
   });
 
-  it('retains legacy recipe context without overriding an explicit current recipe set', () => {
-    const toolCalls = [manage('recipe-1', 'skip_evolution', { outcome: 'verified' })];
-    expect(
-      evolutionGateEvaluator({ toolCalls }, null, { decayedRecipes: [{ id: 'recipe-1' }] }).action
-    ).toBe('pass');
-    expect(
-      evolutionGateEvaluator({ toolCalls }, null, {
-        existingRecipes: [],
-        decayedRecipes: [{ id: 'recipe-2' }],
-      })
-    ).toMatchObject({ action: 'pass', artifact: { totalRecipes: 0, pendingIds: [] } });
+  // W2a-08（C49）：decayedRecipes 别名已删除，原“legacy recipe context”断言随之移除；
+  // 别名被忽略后的行为见 gate-evaluators-scan-stage-narrowing.test.ts。
+  it('treats a missing source as no decisions against the current recipe set', () => {
     expect(evolutionGateEvaluator(null, null)).toMatchObject({
       action: 'pass',
       artifact: { processed: 0, totalRecipes: 0 },
@@ -1491,8 +1483,9 @@ describe('pipeline quality decision adapters', () => {
 
 // ─── L7-P17(C50/C51)：scan 管线装配入口校验与恒定的工具驱动形态 ───
 // buildScanPipelineStages 经 ./prompts 公开；此前默认参数 `{} as ScanPipelineOpts` 让无参/缺字段调用
-// 静默产出没有 rejection_gate、没有 produce 系统提示的残缺管线。签名不变(opts 仍可省略)，但入口
-// 必须以带字段名的 Error 拒绝，而不是把缺口留到运行期低质量输出才暴露。
+// 静默产出没有 rejection_gate、没有 produce 系统提示的残缺管线。W2a-08（C51）起 opts 必填(编译器探针见
+// gate-evaluators-scan-stage-narrowing.test.ts)；不经类型检查的 JS 调用方仍由入口以带字段名的 Error
+// 拒绝，而不是把缺口留到运行期低质量输出才暴露。
 describe('scan pipeline stage assembly (L7-P17)', () => {
   type ScanOpts = Parameters<typeof buildScanPipelineStages>[0];
   const validOpts = (task: 'extract' | 'summarize') => ({
@@ -1509,7 +1502,9 @@ describe('scan pipeline stage assembly (L7-P17)', () => {
   });
 
   it('rejects a call without options instead of assembling a partial pipeline', () => {
-    expect(() => buildScanPipelineStages()).toThrow(/opts\.task/);
+    // opts 已必填：无参调用只能来自不经类型检查的 JS 调用方，这里经 cast 模拟。
+    const untypedBuild = buildScanPipelineStages as unknown as () => unknown;
+    expect(() => untypedBuild()).toThrow(/opts\.task/);
     expect(() => buildScanPipelineStages(null as unknown as ScanOpts)).toThrow(
       /buildScanPipelineStages.*opts/
     );
@@ -1572,7 +1567,8 @@ describe('scan pipeline stage assembly (L7-P17)', () => {
       args: { action: 'submit' },
       result: { status: 'rejected' },
     };
-    // 宿主 strategyContext 透传的 submitToolNames 不能把 scan 拒绝率门改成统计别的工具。
+    // 宿主 strategyContext 透传的 submitToolNames 不能把 scan 拒绝率门改成统计别的工具：
+    // W2a-08（C50）删除该选项后，评估器忽略这个键，拒绝率固定只统计 knowledge.submit。
     expect(
       rejectionGate.gate.evaluator(
         { toolCalls: [rejectedSubmit, rejectedSubmit] },

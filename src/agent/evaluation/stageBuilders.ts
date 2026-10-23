@@ -110,10 +110,10 @@ function readPromptDiagnostics(value: unknown): PromptDiagnosticsSink | null {
  * @param [opts.analyzeMaxIter=24] Analyze 最大迭代
  * @returns PipelineStrategy stages 数组
  */
-export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
-  // 公开签名保持 opts 可省略(改为必填属于公开参数可选性变化，待公开面收窄决定)；但缺 opts、
-  // task 不在 {extract, summarize} 或 producePrompt 为空时，入口直接抛带字段名的 Error，
-  // 不再像旧的 `{} as ScanPipelineOpts` 默认值那样静默装配出缺 rejection_gate/系统提示的残缺管线。
+export function buildScanPipelineStages(opts: ScanPipelineOpts) {
+  // opts 已按决定②改为必填(L7-P27/C51)：TS 调用方在编译期就不能省略。JS/宿主调用方不经类型检查，
+  // 所以运行期仍保留入口校验——缺 opts、task 不在 {extract, summarize} 或 producePrompt 为空时，
+  // 直接抛带字段名的 Error，不装配缺 rejection_gate/系统提示的残缺管线。
   const {
     task,
     producePrompt,
@@ -210,24 +210,12 @@ export function buildScanPipelineStages(opts?: ScanPipelineOpts) {
   };
 
   // ── Stage 4: Rejection Gate ──
+  // 与 insight 预设同一个评估器引用：拒绝率固定只统计 knowledge.submit 回执(submitToolNames 选项已按
+  // 决定②删除，L7-P27/C50)，不再需要包一层覆盖宿主透传的上下文。
   const rejectionGateStage = {
     name: 'rejection_gate',
     gate: {
-      evaluator: (
-        source: unknown,
-        phaseResults: Record<string, unknown>,
-        ctx: Record<string, unknown>
-      ) =>
-        producerRejectionGateEvaluator(
-          source as Parameters<typeof producerRejectionGateEvaluator>[0],
-          phaseResults,
-          {
-            ...ctx,
-            // scan 只经 knowledge 提交；固定覆盖宿主 strategyContext 可能透传的 submitToolNames，
-            // 拒绝率始终只统计 knowledge.submit 回执(与原装配行为一致)。
-            submitToolNames: ['knowledge'],
-          }
-        ),
+      evaluator: producerRejectionGateEvaluator,
       maxRetries: 1,
     },
   };
@@ -248,6 +236,7 @@ const SCAN_PIPELINE_TASKS: ReadonlySet<string> = new Set(['extract', 'summarize'
  * buildScanPipelineStages 入口校验：一次列出所有问题字段，抛带字段名的 Error。
  * 只校验决定管线形态的两项(task 决定预算与提交上限，producePrompt 是 produce 系统提示)；
  * 其余字段沿用原有宽松语义。抛错本身即诊断信号(含字段名与实际值类型)，不做降级装配。
+ * 形参保留 `| undefined`：opts 虽已必填，未经类型检查的 JS 调用方仍可能不传，校验须覆盖这条路径。
  */
 function assertScanPipelineOpts(opts: ScanPipelineOpts | undefined): ScanPipelineOpts {
   if (!opts || typeof opts !== 'object') {

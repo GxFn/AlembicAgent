@@ -348,42 +348,6 @@ export interface EvolutionGateArtifact {
 /** 进化门在管线里的阶段名；下游按名取产物，不依赖它是不是「最近一个门」。 */
 export const EVOLUTION_GATE_STAGE = 'evolution_gate';
 
-/** decayedRecipes 别名回退的诊断消息；宿主日志过滤以此指认仍在写旧字段的调用方。 */
-const DECAYED_RECIPES_ALIAS_LOG_MESSAGE = '[EvolutionGate] legacy decayedRecipes alias used';
-
-/**
- * 解析进化门的期望 Recipe 集合：existingRecipes 优先，缺省时回退旧字段 decayedRecipes。
- *
- * 兼容登记（L7-P27/C49）：
- * - 消费方：目前 Agent、宿主、Core 均无 decayedRecipes 写入方，只有测试钉住该回退；
- * - 原因：旧宿主曾以 decayedRecipes 传入待进化 Recipe；
- * - 移除条件：待决定③确认只支持当前单一宿主后，删除类型字段、本回退与对应测试断言；
- * - 清理触发：决定③答复；本诊断日志若在真实运行中出现，说明仍有隐藏写入方，需先迁移它。
- * existingRecipes 只要给出（哪怕是空数组）就不回退，与原 `??` 语义一致。
- */
-function resolveEvolutionRecipes(strategyContext: {
-  existingRecipes?: Array<{ id: string }>;
-  decayedRecipes?: Array<{ id: string }>;
-}): Array<{ id: string }> {
-  if (strategyContext.existingRecipes != null) {
-    return strategyContext.existingRecipes;
-  }
-  if (strategyContext.decayedRecipes != null) {
-    const recipes = strategyContext.decayedRecipes;
-    observeSafely(
-      () =>
-        logger().warn(DECAYED_RECIPES_ALIAS_LOG_MESSAGE, {
-          reasonCode: 'evolution-gate-decayed-recipes-alias',
-          recipeCount: recipes.length,
-          resolution: 'fallback-to-decayedRecipes',
-        }),
-      () => undefined
-    );
-    return recipes;
-  }
-  return [];
-}
-
 /**
  * Evolution Gate 评估器 — 面向 PipelineStrategy gate.evaluator
  *
@@ -394,17 +358,18 @@ function resolveEvolutionRecipes(strategyContext: {
  *
  * 如果还有未处理的 Recipe，返回 retry 要求补充决策。
  *
- * 兼容旧字段: 优先读 existingRecipes，回退 decayedRecipes（兼容登记见 resolveEvolutionRecipes）。
+ * 期望集合只来自 strategyContext.existingRecipes（唯一写入方是 runEvolutionAudit）。旧宿主别名
+ * decayedRecipes 在 Agent、宿主、Core 都没有写入方，已按决定③删除（L7-P27/C49，W2a-08）：仍传该字段的
+ * JS 调用方得到空期望集合，门直接 pass；这不是降级路径，只是未知字段被忽略，因此不再记别名日志。
  */
 export function evolutionGateEvaluator(
   source: { toolCalls?: EvolutionToolCallRecord[] } | null | undefined,
   _phaseResults: unknown,
   strategyContext: {
     existingRecipes?: Array<{ id: string }>;
-    decayedRecipes?: Array<{ id: string }>;
   } = {}
 ) {
-  const recipes = resolveEvolutionRecipes(strategyContext);
+  const recipes = strategyContext.existingRecipes ?? [];
   const totalRecipes = recipes.length;
   const expectedIds = recipes.map((r) => r.id);
   // 门配置了 useCumulativeToolCalls：这里看到的是进化阶段全部尝试的累计回执，
@@ -498,20 +463,25 @@ interface ReactLoopResult {
   toolCalls?: readonly unknown[];
 }
 
-/** 门控策略上下文 */
+/**
+ * 门控策略上下文：PipelineStrategy 透传的 strategyContext，本评估器不读取其中任何字段。
+ *
+ * 原 submitToolNames 选项已按决定②删除（L7-P27/C50，W2a-08）：hasPersistedCandidate 只认 knowledge
+ * 回执形状，点名其他工具时它们一律被计为 rejected，选项对非 knowledge 工具语义失效；宿主与三仓也没有
+ * 传入方。宿主若仍透传该键，只会落进下面的索引签名被忽略，拒绝率固定只统计 knowledge.submit。
+ */
 interface GateStrategyContext {
-  submitToolNames?: string[];
   [key: string]: unknown;
 }
 
-/** 一组工具调用里提交类调用的已持久化/未持久化计数。 */
-function countSubmissions(
-  toolCalls: readonly unknown[],
-  names: readonly string[]
-): { success: number; rejected: number } {
+/**
+ * 一组工具调用里 knowledge.submit 的已持久化/未持久化计数。
+ * 只有 knowledge.submit 计入：hasPersistedCandidate 只认 knowledge 回执形状，其他工具不参与拒绝率。
+ */
+function countSubmissions(toolCalls: readonly unknown[]): { success: number; rejected: number } {
   const submitCalls = toolCalls.filter((call) => {
     const { tool } = readToolObservation(call);
-    return names.includes(tool) && (tool !== 'knowledge' || isKnowledgeSubmit(call));
+    return tool === 'knowledge' && isKnowledgeSubmit(call);
   });
   const success = submitCalls.filter(hasPersistedCandidate).length;
   return { success, rejected: submitCalls.length - success };
@@ -572,7 +542,7 @@ function readPriorSourceAttempts(
 /**
  * Producer 拒绝率门控 — 面向 PipelineStrategy gate.evaluator
  *
- * 当 produce 阶段的提交拒绝率过高时触发 retry。
+ * 当 produce 阶段的提交拒绝率过高时触发 retry。只统计 knowledge.submit 回执(countSubmissions)。
  *
  * 首轮(没有先前尝试)：本次尝试的提交拒绝数大于成功数且拒绝 ≥2 时为 retry。
  * 重试轮(C08/L7-P18，源阶段带 `_priorAttempts_<stage>`)：phaseResults[<stage>] 只剩最后一次尝试的回执，
@@ -582,20 +552,21 @@ function readPriorSourceAttempts(
  *
  * @param source produce 阶段的 reactLoop 返回值
  * @param phaseResults 阶段结果表；重试轮从中读取源阶段的先前尝试
+ * @param _strategyContext PipelineStrategy 按 gate.evaluator 约定透传的上下文；保留形参只为与门评估器
+ *   签名对齐，不读取任何字段(submitToolNames 已删除，见 GateStrategyContext)
  * @returns `{ action, reason }`：retry 时 reason 写明本次拒绝/成功数；重试轮合计有已持久化候选时为 pass
  *   且 reason 写明合计与本次计数；其余(含 source 无 toolCalls)为 pass、reason 为空串。
  */
 export function producerRejectionGateEvaluator(
   source: ReactLoopResult | null | undefined,
   phaseResults: unknown,
-  strategyContext: GateStrategyContext = {}
+  _strategyContext: GateStrategyContext = {}
 ) {
   if (!source?.toolCalls) {
     return { action: 'pass', reason: '' };
   }
 
-  const names = strategyContext.submitToolNames ?? ['knowledge'];
-  const { success, rejected } = countSubmissions(source.toolCalls || [], names);
+  const { success, rejected } = countSubmissions(source.toolCalls || []);
   const perAttempt =
     rejected > success && rejected >= 2
       ? { action: 'retry', reason: `${rejected} rejections vs ${success} successes` }
@@ -606,7 +577,7 @@ export function producerRejectionGateEvaluator(
     return perAttempt;
   }
 
-  const priorCounts = countSubmissions(prior.toolCalls, names);
+  const priorCounts = countSubmissions(prior.toolCalls);
   const totalSuccess = success + priorCounts.success;
   const totalRejected = rejected + priorCounts.rejected;
   const totalAttempts = prior.attempts + 1;
