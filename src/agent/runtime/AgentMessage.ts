@@ -1,25 +1,22 @@
 /**
  * AgentMessage — 统一消息信封
  *
- * 核心抽象: Agent 永远不需要知道消息来自哪个渠道。
- * Transport 适配器负责将渠道特定格式转换为 AgentMessage,
- * Agent 只处理 AgentMessage, 通过 replyFn 返回结果。
+ * 核心抽象: Agent 只处理 AgentMessage，不关心消息来自哪个渠道。
+ * 宿主在自己的边界内完成鉴权与形状归一化后，用 `new AgentMessage({ content, sender, session, ... })`
+ * 显式构造消息；运行结束后由宿主读取 `AgentResult.reply` 自行投递，Agent 不回写渠道。
+ * Agent 间的子消息用 `AgentMessage.internal()` 构造。
  *
- *   - HTTP/SSE (Dashboard)  → AgentMessage { channel: 'http', ... }
- *   - CLI (终端)             → AgentMessage { channel: 'cli',  ... }
- *   - MCP (host adapter)     → AgentMessage { channel: 'mcp',  ... }
+ * W2a-05（L5-P42 / I41）已退役 transport 工厂 fromHttp/fromCli/fromMcp 与 replyFn 回写：
+ * 它们没有任何调用方；fromHttp 把请求体 userId 当身份，可伪造 SafetyPolicy 白名单；replyFn 在执行期限与
+ * 取消之外被 await，挂起会让 execute 永不返回。`Channel` 的键集合按批准范围保留（其中 CLI 已无生产者）。
  *
- * 这里只保留 Agent 内部的消息归一化能力；具体 Codex MCP server、
- * marketplace/channel 和 host-agent route 由 AlembicPlugin 或其它宿主实现。
+ * 具体 Codex MCP server、marketplace/channel 和 host-agent route 由 AlembicPlugin 或其它宿主实现。
  *
  * @module AgentMessage
  */
 
 import { randomUUID } from 'node:crypto';
 import Logger from '@alembic/core/logging';
-
-/** Reply callback type */
-type ReplyFn = (text: string) => Promise<void>;
 
 /** Sender identity */
 interface Sender {
@@ -41,38 +38,6 @@ interface AgentMessageOptions {
   session?: Session;
   sender?: Sender;
   metadata?: Record<string, unknown>;
-  replyFn?: ReplyFn | null;
-}
-
-/** HTTP request body shape */
-interface HttpRequestBody {
-  prompt?: string;
-  message?: string;
-  content?: string;
-  conversationId?: string;
-  sessionId?: string;
-  history?: Array<{ role: string; content: string }>;
-  userId?: string;
-  userName?: string;
-  lang?: string;
-  mode?: string;
-  context?: unknown;
-  stream?: boolean;
-}
-
-/** Minimal Express-like request */
-interface HttpRequest {
-  body?: HttpRequestBody;
-  ip?: string;
-}
-
-/** CLI options */
-interface CliOptions {
-  sessionId?: string;
-  history?: Array<{ role: string; content: string }>;
-  cwd?: string;
-  mode?: string;
-  metadata?: Record<string, unknown>;
 }
 
 /** Internal message options */
@@ -88,20 +53,6 @@ interface InternalMessageOptions {
   metadata?: Record<string, unknown>;
   /** Extra pass-through keys (e.g. 'source') */
   [key: string]: unknown;
-}
-
-/** Normalized MCP-like request shape supplied by a host/plugin adapter. */
-interface McpRequest {
-  prompt?: string;
-  content?: string;
-  arguments?: Record<string, unknown> & { prompt?: string };
-  sessionId?: string;
-  history?: Array<{ role: string; content: string }>;
-  clientId?: string;
-  clientName?: string;
-  toolName?: string;
-  mode?: string;
-  metadata?: Record<string, unknown>;
 }
 
 /** internal() 中可由调用方显式传入、并优先于 opts.metadata 同名键的字段 */
@@ -154,7 +105,10 @@ function mergeInternalMetadata(opts: InternalMessageOptions): Record<string, unk
   return metadata;
 }
 
-/** 通信渠道枚举 */
+/**
+ * 通信渠道枚举：只是宿主构造消息时写入的渠道标签（AgentService 按运行来源产出 http/mcp/internal，internal() 产出 internal）。
+ * 键集合是公开契约，transport 工厂退役后 CLI 已无 Agent 内生产者，但收窄未获授权，保持不变。
+ */
 export const Channel = Object.freeze({
   HTTP: 'http',
   CLI: 'cli',
@@ -175,8 +129,6 @@ export class AgentMessage {
   sender;
   /** 渠道特定元数据 */
   metadata;
-  /** 回复函数 (text: string) => Promise<void> */
-  replyFn;
   /** 时间戳 */
   timestamp;
 
@@ -186,7 +138,6 @@ export class AgentMessage {
    * @param [opts.session] 会话
    * @param [opts.sender] 发送者
    * @param [opts.metadata] 元数据
-   * @param [opts.replyFn] 回复函数
    */
   constructor({
     content,
@@ -194,7 +145,6 @@ export class AgentMessage {
     session,
     sender,
     metadata,
-    replyFn,
   }: AgentMessageOptions = {}) {
     this.id = randomUUID();
     this.content = content || '';
@@ -202,79 +152,12 @@ export class AgentMessage {
     this.session = session || { id: randomUUID(), history: [] };
     this.sender = sender || { id: 'anonymous', type: 'user' };
     this.metadata = metadata || {};
-    this.replyFn = replyFn || null;
     this.timestamp = Date.now();
   }
 
   /** 对话历史 (快捷访问) */
   get history() {
     return this.session.history || [];
-  }
-
-  /** 向发送方回复 */
-  async reply(text: string) {
-    if (this.replyFn) {
-      await this.replyFn(text);
-    }
-  }
-
-  // ─── Transport 工厂方法 ─────────────────────
-  // fromHttp/fromCli/fromMcp 均已 @deprecated：去留待全局事项②决定，决定前保留以免公开签名变化。
-
-  /**
-   * 从 HTTP 请求构建
-   *
-   * @deprecated 待全局事项②决定删除（I41/P42 推荐删除路线）；src、测试与宿主中均无调用方，新代码不要使用。
-   * 身份风险：sender.id 直接取请求体 `body.userId`（其次 req.ip），未经宿主鉴权，调用方可自报身份，
-   * 从而伪造 SafetyPolicy `allowedSenders` 白名单；`body.prompt`/`history` 也不做形状校验。
-   * 若必须接 HTTP，请由宿主完成鉴权后用 `new AgentMessage({ sender })` 显式传入已鉴权身份。
-   * @param req Express request
-   * @param [replyFn] SSE 或 JSON 回复
-   */
-  static fromHttp(req: HttpRequest, replyFn?: ReplyFn) {
-    const body = req.body || ({} as HttpRequestBody);
-    return new AgentMessage({
-      content: body.prompt || body.message || body.content || '',
-      channel: Channel.HTTP,
-      session: {
-        id: body.conversationId || body.sessionId || randomUUID(),
-        history: body.history || [],
-      },
-      sender: {
-        id: body.userId || req.ip || 'http-user',
-        name: body.userName,
-        type: 'user',
-      },
-      metadata: {
-        lang: body.lang,
-        mode: body.mode, // 手动指定 preset
-        context: body.context, // 额外上下文
-        stream: body.stream ?? true,
-      },
-      replyFn,
-    });
-  }
-
-  /**
-   * 从 CLI 输入构建
-   *
-   * @deprecated 待全局事项②决定删除（I41/P42 推荐删除路线）；src、测试与宿主中均无调用方，新代码不要使用。
-   * 身份风险：sender 固定为 `cli-user`，未传 sessionId 时所有调用共用 `cli-session`，不同调用方之间
-   * 无法区分身份与会话；SafetyPolicy 白名单只能整体放行或拒绝 `cli-user`。
-   * @param input 命令行输入
-   */
-  static fromCli(input: string, opts: CliOptions = {}) {
-    return new AgentMessage({
-      content: input,
-      channel: Channel.CLI,
-      session: { id: opts.sessionId || 'cli-session', history: opts.history || [] },
-      sender: { id: 'cli-user', type: 'user' },
-      metadata: {
-        cwd: opts.cwd || process.cwd(),
-        mode: opts.mode,
-        ...opts.metadata,
-      },
-    });
   }
 
   /**
@@ -294,38 +177,6 @@ export class AgentMessage {
         type: 'agent',
       },
       metadata: mergeInternalMetadata(opts),
-    });
-  }
-
-  /**
-   * 从宿主注入的 MCP-like 请求构建；不实现 Codex MCP server 或插件路由。
-   *
-   * @deprecated 待全局事项②决定删除（I41/P42 推荐删除路线）；src、测试与宿主中均无调用方，新代码不要使用。
-   * 身份风险：sender.id 直接取请求里的 `clientId`（缺省 `mcp-client`），未经宿主鉴权，调用方可自报身份
-   * 伪造 SafetyPolicy 白名单；`mcpReq.metadata` 会覆盖 toolName/arguments/mode 等同名键。
-   * @param mcpReq normalized tool call request
-   * @param [replyFn] 回复函数
-   */
-  static fromMcp(mcpReq: McpRequest, replyFn?: ReplyFn) {
-    return new AgentMessage({
-      content: mcpReq.prompt || mcpReq.content || mcpReq.arguments?.prompt || '',
-      channel: Channel.MCP,
-      session: {
-        id: mcpReq.sessionId || randomUUID(),
-        history: mcpReq.history || [],
-      },
-      sender: {
-        id: mcpReq.clientId || 'mcp-client',
-        name: mcpReq.clientName,
-        type: 'user',
-      },
-      metadata: {
-        toolName: mcpReq.toolName,
-        arguments: mcpReq.arguments,
-        mode: mcpReq.mode,
-        ...mcpReq.metadata,
-      },
-      replyFn,
     });
   }
 
