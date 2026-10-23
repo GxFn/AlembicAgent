@@ -191,17 +191,8 @@ export class PersistentMemory {
     return changes;
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // Legacy Migration — 委托 MemoryConsolidator
-  // ═══════════════════════════════════════════════════════════
-
-  /**
-   * 从旧版 Memory.js JSONL 文件迁移（委托 MemoryConsolidator，不传 WriteZone）
-   * @deprecated src、宿主与测试都不调用；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  async migrateFromLegacy(projectRoot: string) {
-    return this.#consolidator.migrateFromLegacy(projectRoot);
-  }
+  // 旧版 Memory.js JSONL 迁移入口 migrateFromLegacy 已随 W2a-10（审阅包 L6-P25）删除：src、宿主与
+  // 测试从未调用，持久记忆只经 SQLite 与 consolidate 写入。
 
   // ═══════════════════════════════════════════════════════════
   // 向量嵌入接口 — 委托 MemoryRetriever

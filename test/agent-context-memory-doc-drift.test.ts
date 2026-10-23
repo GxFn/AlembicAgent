@@ -163,26 +163,23 @@ describe('agent context/memory/prompts doc drift guard', () => {
     expect(forceExitLine).toMatch(/不可达/);
   });
 
-  it('keeps ActiveContext getStats and lightweight comments aligned with their real consumers', () => {
+  it('keeps ActiveContext getStats aligned with its real consumers and drops the retired option comments', () => {
     const source = readSource('src/agent/memory/ActiveContext.ts');
     const getStatsDoc = jsDocBefore(source, '  getStats() {');
     expect(getStatsDoc).not.toBe('');
     // PlanTracker / ExplorationTracker.getQualityMetrics 已随 W2a-09 删除；真实消费者是反思 nudge、LLMInputAssembly 等。
     expect(getStatsDoc).not.toMatch(/getQualityMetrics/);
     expect(getStatsDoc).toMatch(/LLMInputAssembly/);
-    // lightweight 只跳过滑动窗口与 buildContext，noteKeyFinding 仍写 Scratchpad。
-    const lightweightLines = source
-      .split('\n')
-      .filter((line) => /lightweight|轻量模式/.test(line) && /^\s*(?:\*|\/\*\*|\/\/)/.test(line));
-    expect(lightweightLines.length).toBeGreaterThan(0);
-    for (const line of lightweightLines) {
-      expect({
-        line: line.trim(),
-        claimsScratchpadDisabled: /(?:禁用|跳过)[^\n]*Scratchpad/.test(line),
-      }).toEqual({
-        line: line.trim(),
-        claimsScratchpadDisabled: false,
-      });
+    // 轻量开关（ActiveContextOptions / DimensionScopeConfig 的同名选项）已随 W2a-10 删除：生产恒为
+    // false，它的 5 处分支都是死分支。两个文件的注释都不能再介绍这个选项。
+    for (const relativePath of [
+      'src/agent/memory/ActiveContext.ts',
+      'src/agent/memory/MemoryCoordinator.ts',
+    ]) {
+      const commentLines = readSource(relativePath)
+        .split('\n')
+        .filter((line) => /lightweight|轻量模式/.test(line) && /^\s*(?:\*|\/\*\*|\/\/)/.test(line));
+      expect({ relativePath, commentLines }).toEqual({ relativePath, commentLines: [] });
     }
   });
 

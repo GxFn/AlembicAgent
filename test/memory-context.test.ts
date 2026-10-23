@@ -1,9 +1,8 @@
 import fs, { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import os, { tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import path, { join } from 'node:path';
 import { pathGuard, WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
-import { WorkspaceResolver } from '@alembic/core/workspace';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { EpisodicConsolidator } from '../src/agent/memory/EpisodicConsolidator.js';
@@ -20,6 +19,7 @@ import type {
   DimensionReportInput,
   TierReflection,
 } from '../src/agent/memory/SessionStore.js';
+import { validateSessionStoreShape } from '../src/agent/memory/SessionStoreSchema.js';
 import { AgentStageFactoryRegistry } from '../src/agent/profiles/AgentStageFactoryRegistry.js';
 import {
   ConversationStore,
@@ -1405,7 +1405,6 @@ describe('MemoryCoordinator', () => {
     coordinator.allocateBudget('analyst', 1000);
     release('retained');
     expect(estimateTokens(await pending)).toBeLessThanOrEqual(100);
-    coordinator.dispose();
   });
   it('normalizes invalid time limits without creating an unbounded request', async () => {
     vi.useFakeTimers();
@@ -1452,7 +1451,6 @@ describe('MemoryCoordinator', () => {
       expect(result).toContain('Session evidence remains available');
     } finally {
       session.dispose();
-      coordinator.dispose();
     }
   });
   it('isolates per-scope budgets when asynchronous reads finish in reverse order', async () => {
@@ -1484,7 +1482,6 @@ describe('MemoryCoordinator', () => {
     await pendingA;
     coordinator.buildDynamicMemoryPrompt({ scopeId: 'b', mode: 'producer' });
     expect(build).toHaveBeenLastCalledWith(100);
-    coordinator.dispose();
   });
   it.each([
     0, 100,
@@ -1502,7 +1499,6 @@ describe('MemoryCoordinator', () => {
     if (budget === 0) {
       expect(persistent.toPromptSection).not.toHaveBeenCalled();
     }
-    coordinator.dispose();
   });
   it('passes the allocated budget into persistent and session memory ports', async () => {
     const persistent = { toPromptSection: vi.fn(() => ''), append: vi.fn() };
@@ -1582,25 +1578,22 @@ describe('MemoryCoordinator', () => {
     });
   });
 
-  it('handles typed persistent memory write failures with coordinator diagnostics', () => {
+  it('never writes persistent memory from the coordinator once extractFromConversation is gone', async () => {
+    // extractFromConversation（对话规则匹配写入 PersistentMemory 的唯一入口）已随 W2a-10 删除：
+    // coordinator 只经 MemoryPromptPort 读取持久记忆，注入端口的 append 不再被调用，写入失败诊断
+    // 也就没有来源（getDiagnostics 保留，恒为空）。
+    const append = vi.fn(() => {
+      throw new MemoryStoreWriteError('add', new Error('disk full'));
+    });
     const coordinator = new MemoryCoordinator({
-      persistentMemory: {
-        toPromptSection: () => '',
-        append() {
-          throw new MemoryStoreWriteError('add', new Error('disk full'));
-        },
-      },
+      persistentMemory: { toPromptSection: () => 'persistent fact', append },
     });
 
-    coordinator.extractFromConversation('记住以后记录 Agent boundary', '', 'user');
-
-    expect(coordinator.getDiagnostics().writeFailures).toEqual([
-      expect.objectContaining({
-        code: 'MEMORY_STORE_WRITE_FAILED',
-        message: 'MemoryStore add failed: disk full',
-        operation: 'persistentMemory.append',
-      }),
-    ]);
+    expect(await coordinator.buildStaticMemoryPrompt({ mode: 'user' })).toContain(
+      'persistent fact'
+    );
+    expect(append).not.toHaveBeenCalled();
+    expect(coordinator.getDiagnostics().writeFailures).toEqual([]);
   });
 });
 
@@ -1657,7 +1650,6 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
     });
     expect(dimA.scratchpadSize).toBe(1);
     expect(dimB.scratchpadSize).toBe(0);
-    coordinator.dispose();
   });
 
   it('keeps the single-scope implicit fallback writable and logs implicit-current-scope at debug', () => {
@@ -1683,7 +1675,6 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
     expect(messagesOf(log.warn).filter((message) => message.includes('scopeId'))).toEqual([]);
     // 公开 getActiveContext() 无参语义不变：仍回退到最近创建的 scope。
     expect(coordinator.getActiveContext()).toBe(only);
-    coordinator.dispose();
   });
 
   it('returns an empty dynamic memory prompt without scopeId when several scopes are active', () => {
@@ -1703,7 +1694,6 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
     ).toContain('dimB private working memory');
     // 公开 getActiveContext() 无参语义不变（只在内部调用点加守卫）。
     expect(coordinator.getActiveContext()?.scratchpadSize).toBe(1);
-    coordinator.dispose();
   });
 
   it('locates the missing-SessionStore degradation in logs when get_previous_evidence runs through the handler', async () => {
@@ -1730,7 +1720,6 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
       message.includes('MEMORY_EVIDENCE_STORE_MISSING')
     );
     expect(debugs.some((message) => message.includes('query="Bar"'))).toBe(true);
-    coordinator.dispose();
   });
 
   it('does not reset the shared memory budget from the generate producer stage promptBuilder', () => {
@@ -1751,10 +1740,9 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
     }
 
     expect(allocateBudget).not.toHaveBeenCalled();
-    coordinator.dispose();
   });
 
-  it('logs swallowed conversation summary and dispose failures instead of dropping them', async () => {
+  it('logs swallowed conversation summary failures instead of dropping them', async () => {
     const log = spyLogger();
     const coordinator = new MemoryCoordinator({
       conversationLog: {
@@ -1771,16 +1759,7 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
     );
     expect(summaryWarning).toContain('conv-1');
     expect(summaryWarning).toContain('summary provider offline');
-
-    const scope = coordinator.createDimensionScope('dimA:analyst');
-    vi.spyOn(scope, 'clear').mockImplementation(() => {
-      throw new Error('clear exploded');
-    });
-    coordinator.dispose();
-    const disposeWarning = messagesOf(log.warn).find((message) => message.includes('dispose'));
-    expect(disposeWarning).toContain('dimA:analyst');
-    expect(disposeWarning).toContain('clear exploded');
-    expect(coordinator.getActiveContext('dimA:analyst')).toBeNull();
+    // dispose 失败告警随 MemoryCoordinator.dispose 一并删除（W2a-10；宿主只 dispose SessionStore）。
   });
 
   it('reports non-Error throws by value in noteFinding receipts instead of "undefined"', () => {
@@ -1797,7 +1776,6 @@ describe('MemoryCoordinator scope guard, budget call and diagnostics (L6-P12)', 
     expect(result).toMatchObject({ recorded: false, target: 'error', scopeId: 'dimA:analyst' });
     expect(result.message).toContain('scratchpad locked');
     expect(result.message).not.toContain('undefined');
-    coordinator.dispose();
   });
 
   it('reports the persistent read error class without leaking the error message', async () => {
@@ -1907,51 +1885,53 @@ describe('SessionStore', () => {
       empty.dispose();
     }
   });
-  it('preserves evidence through JSON and checkpoint round trips without merging old state', async () => {
-    const root = makeTempRoot('session-evidence');
+  it('preserves evidence through a persisted JSON snapshot round trip', () => {
+    // 检查点文件链（saveCheckpoint / loadCheckpoint）已随 W2a-10 删除；宿主断点续跑保存 toJSON()
+    // 快照、经 fromJSON() 恢复，这里按同一条路径（含 JSON 序列化）验证证据往返。
     const store = new SessionStore();
-    store.addEvidence('src/a.ts', {
-      finding: 'Evidence survives restart',
-      importance: 8,
-      dimId: 'a',
+    store.storeDimensionReport('a', {
+      findings: [{ finding: 'Evidence survives restart', evidence: 'src/a.ts:3', importance: 8 }],
     });
     const before = store.searchEvidence('survives');
-    const restored = SessionStore.fromJSON(store.toJSON());
+    expect(before).toHaveLength(1);
+    const restored = SessionStore.fromJSON(JSON.parse(JSON.stringify(store.toJSON())));
     try {
       expect(restored.searchEvidence('survives')).toEqual(before);
-      await store.saveCheckpoint(root);
-      restored.addEvidence('src/stale.ts', { finding: 'Old state', importance: 1, dimId: 'old' });
-      expect(await restored.loadCheckpoint(root)).toBe(true);
-      expect(restored.searchEvidence('survives')).toEqual(before);
-      expect(restored.searchEvidence('Old state')).toEqual([]);
+      // 恢复得到独立实例：之后对原实例的写入不会出现在恢复出的会话里。
+      store.storeDimensionReport('late', {
+        findings: [
+          { finding: 'Written after the snapshot', evidence: 'src/b.ts:1', importance: 5 },
+        ],
+      });
+      expect(restored.searchEvidence('after the snapshot')).toEqual([]);
     } finally {
       store.dispose();
       restored.dispose();
     }
   });
 
-  it('rejects malformed checkpoints without partially replacing live state', async () => {
-    const root = makeTempRoot('session-invalid');
-    const store = new SessionStore();
-    store.addEvidence('src/a.ts', { finding: 'Keep existing evidence', importance: 8 });
-    await store.saveCheckpoint(root);
-    const before = store.toJSON();
-    const checkpoint = join(root, '.asd/bootstrap-checkpoint/session-store.json');
-    writeFileSync(
-      checkpoint,
-      JSON.stringify({
-        version: 2,
-        savedAt: Date.now(),
-        dimensionReports: { invalid: null },
-        crossReferences: [],
-      })
+  it('rejects a malformed persisted snapshot through fromJSON and validateSessionStoreShape', () => {
+    // 原“坏检查点不部分替换现有状态”用例（L6-P08）迁到快照入口：坏报告在构造任何状态之前被拒绝。
+    const malformed = {
+      dimensionReports: { invalid: null },
+      crossReferences: [],
+    };
+    expect(() => validateSessionStoreShape(malformed)).toThrow('SessionStore schema');
+    expect(() => SessionStore.fromJSON(malformed)).toThrow('SessionStore schema');
+    // 报告 dimId 与所在键不一致同样拒绝，否则 getDimensionReport(key) 会返回另一个维度名。
+    expect(() => validateSessionStoreShape({ dimensionReports: { a: { dimId: 'b' } } })).toThrow(
+      'SessionStore schema: dimension report key a does not match dimId b'
     );
-    expect(await store.loadCheckpoint(root)).toBe(false);
-    expect(store.toJSON()).toEqual(before);
-    store.dispose();
+    // 缺失字段补默认值（兼容旧快照），不是拒绝。
+    expect(validateSessionStoreShape({ dimensionReports: { a: {} } })).toMatchObject({
+      dimensionReports: { a: { dimId: 'a', findings: [], digest: null } },
+      crossReferences: [],
+      tierReflections: [],
+      submittedCandidates: {},
+    });
   });
-  it('saves and restores bootstrap checkpoints while validating serialized shape', async () => {
-    const root = makeTempRoot('session-store');
+
+  it('restores a persisted session snapshot while validating serialized shape', () => {
     const store = new SessionStore();
 
     store.storeDimensionReport('api', {
@@ -1988,12 +1968,9 @@ describe('SessionStore', () => {
       summary: 'Host calls agent contract.',
     });
 
-    await store.saveCheckpoint(root);
-    const checkpointPath = join(root, '.asd', 'bootstrap-checkpoint', 'session-store.json');
-
-    expect(existsSync(checkpointPath)).toBe(true);
-    expect(JSON.parse(readFileSync(checkpointPath, 'utf-8'))).toMatchObject({
-      version: 2,
+    // 宿主断点续跑的持久化形态：toJSON() 快照经 JSON 落盘，再由 fromJSON() 恢复。
+    const persisted = JSON.parse(JSON.stringify(store.toJSON()));
+    expect(persisted).toMatchObject({
       dimensionReports: {
         api: {
           analysisText: 'API boundary analysis',
@@ -2002,9 +1979,8 @@ describe('SessionStore', () => {
       },
     });
 
-    const restored = new SessionStore();
+    const restored = SessionStore.fromJSON(persisted);
 
-    expect(await restored.loadCheckpoint(root)).toBe(true);
     expect(restored.getDimensionReport('api')).toMatchObject({
       dimId: 'api',
       analysisText: 'API boundary analysis',
@@ -2016,7 +1992,7 @@ describe('SessionStore', () => {
       totalCandidates: 1,
       crossReferences: 1,
     });
-    // 只读工具缓存已删除（W1-04）：cache 统计在过渡期固定为全零，检查点往返后仍然成立。
+    // 只读工具缓存已删除（W1-04）：cache 统计在过渡期固定为全零，快照往返后仍然成立。
     const zeroCache = {
       hits: 0,
       misses: 0,
@@ -2027,7 +2003,6 @@ describe('SessionStore', () => {
     };
     expect(store.getStats().cache).toEqual(zeroCache);
     expect(restored.getStats().cache).toEqual(zeroCache);
-    expect(SessionStore.fromJSON(store.toJSON()).getStats().cache).toEqual(zeroCache);
     expect(() => SessionStore.fromJSON({ dimensionReports: [] })).toThrow(
       'SessionStore schema: dimensionReports must be a Record'
     );
@@ -2063,9 +2038,8 @@ describe('SessionStore dimension write contract', () => {
       const context = s.buildContextForDimension('b');
       expect(context).toContain('DIGEST-A');
       expect(context).toContain('- [来自 a] look at X');
-      expect(s.buildContextSnapshot('b').previousDimensions.a.crossRefs).toEqual({
-        b: 'look at X',
-      });
+      // buildContextSnapshot 已随 W2a-10 删除；沿用的 digest 直接从报告投影读取。
+      expect(s.getDimensionReport('a')?.digest?.crossRefs).toEqual({ b: 'look at X' });
       // 再次省略 digest 仍沿用同一份 digest；派生 crossRefs 按一代重建，不会累加。
       s.storeDimensionReport('a', { analysisText: 'second generation' });
       expect(s.getStats().crossReferences).toBe(1);
@@ -2260,33 +2234,20 @@ describe('SessionStore dimension write contract', () => {
     }
   });
 
-  it('refuses a type-corrupted checkpoint and reports non-Error load failures by value', async () => {
-    const warnings = captureWarnings();
-    const root = makeTempRoot('session-typed-checkpoint');
+  it('refuses a type-corrupted persisted snapshot and names the offending field', () => {
+    // 原“类型损坏的检查点被拒绝”用例（L6-P08）迁到快照入口：宿主持久化的 toJSON() 快照被改坏后，
+    // fromJSON 在构造任何状态前抛出带字段名的 schema 错误。loadCheckpoint 的“读失败降级为无检查点”
+    // 分支随检查点链一并删除（W2a-10），宿主自行处理读取失败。
     const s = new SessionStore();
-    const restored = new SessionStore();
     try {
       s.storeDimensionReport('a', { analysisText: 'live state' });
-      await s.saveCheckpoint(root);
-      const checkpoint = join(root, '.asd/bootstrap-checkpoint/session-store.json');
-      const data = JSON.parse(readFileSync(checkpoint, 'utf-8'));
+      const data = JSON.parse(JSON.stringify(s.toJSON()));
       data.dimensionReports.a.completedAt = 'yesterday';
-      writeFileSync(checkpoint, JSON.stringify(data));
-      expect(await restored.loadCheckpoint(root)).toBe(false);
-      expect(restored.getCompletedDimensions()).toEqual([]);
-      expect(warnings()).toContain(
-        'Failed to load checkpoint: SessionStore schema: invalid completedAt'
-      );
-      vi.spyOn(fs, 'readFileSync').mockImplementation(() => {
-        // biome-ignore lint/style/useThrowOnlyError: 故意抛出非 Error 值，覆盖 loadCheckpoint catch 的类型守卫分支。
-        throw 'disk unavailable';
-      });
-      expect(await restored.loadCheckpoint(root)).toBe(false);
-      expect(warnings()).toContain('Failed to load checkpoint: disk unavailable');
+      expect(() => SessionStore.fromJSON(data)).toThrow('SessionStore schema: invalid completedAt');
+      // 原实例不受影响。
+      expect(s.getDimensionReport('a')?.analysisText).toBe('live state');
     } finally {
-      vi.restoreAllMocks();
       s.dispose();
-      restored.dispose();
     }
   });
 });
@@ -3196,34 +3157,6 @@ it('snapshot edits do not mutate the current session', () => {
     store.dispose();
   }
 });
-it('failed checkpoint write leaves the last valid checkpoint readable', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-probe-'));
-  const store = new SessionStore();
-  const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
-  try {
-    store.storeDimensionReport('runtime', { analysisText: 'last valid state' });
-    await store.saveCheckpoint(root);
-    const before = fs.readFileSync(target, 'utf8');
-    const write = fs.writeFileSync;
-    vi.spyOn(fs, 'writeFileSync').mockImplementation(((
-      file: fs.PathOrFileDescriptor,
-      ...args: unknown[]
-    ) => {
-      if (String(file).startsWith(target)) {
-        write(file, '{partially-written');
-        throw new Error('injected ENOSPC');
-      }
-      return write(file, ...(args as [string, fs.WriteFileOptions]));
-    }) as typeof fs.writeFileSync);
-    store.storeDimensionReport('runtime', { analysisText: 'next state' });
-    await expect(store.saveCheckpoint(root)).rejects.toThrow('injected ENOSPC');
-    expect(fs.readFileSync(target, 'utf8')).toBe(before);
-  } finally {
-    vi.restoreAllMocks();
-    store.dispose();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
 it('resolves contradictory candidates within the same incoming batch', () => {
   const db = new Database(':memory:');
   try {
@@ -3338,8 +3271,11 @@ it('migrates legacy ledger-label evidence indexes before replacing a restored re
     };
     const restored = SessionStore.fromJSON(legacy);
     try {
-      expect(restored.getEvidenceForFile('src/a.ts')).toHaveLength(1);
-      expect(restored.getEvidenceForFile('src/b.ts')).toHaveLength(1);
+      // getEvidenceForFile 已随 W2a-10 删除：按文件键直接观测恢复后的快照索引。
+      const evidenceIndex = restored.toJSON().evidenceStore ?? {};
+      expect(Object.keys(evidenceIndex).sort()).toEqual(['src/a.ts', 'src/b.ts']);
+      expect(evidenceIndex['src/a.ts']).toHaveLength(1);
+      expect(evidenceIndex['src/b.ts']).toHaveLength(1);
       restored.storeDimensionReport('runtime', { findings: [] });
       expect(restored.searchEvidence('')).toEqual([]);
     } finally {
@@ -3365,10 +3301,12 @@ it.each([
     ]);
     const restored = SessionStore.fromJSON(legacy);
     try {
-      expect(restored.getEvidenceForFile(key)).toHaveLength(1);
-      expect(Object.hasOwn(restored.buildContextSnapshot('next').previousDimensions, key)).toBe(
-        true
-      );
+      // getEvidenceForFile / buildContextSnapshot 已随 W2a-10 删除：改由快照与报告查询观测。
+      const snapshot = restored.toJSON();
+      expect(Object.hasOwn(snapshot.evidenceStore ?? {}, key)).toBe(true);
+      expect(snapshot.evidenceStore?.[key]).toHaveLength(1);
+      expect(Object.hasOwn(snapshot.dimensionReports, key)).toBe(true);
+      expect(restored.getCompletedDimensions()).toEqual([key]);
     } finally {
       restored.dispose();
     }
@@ -3508,7 +3446,9 @@ it('bad report replacement must not remove the live report indexes', () => {
     s.dispose();
   }
 });
-it('producer projection cannot alter the owned working-memory report', () => {
+it('report projection cannot alter the owned working-memory report', () => {
+  // getDistilledForProducer 已随 W2a-10 删除；同一份蒸馏数据经 getDimensionReport 投影读取，
+  // 投影同样是副本，改写它不能回写到会话里的报告。
   const s = new SessionStore();
   try {
     s.storeDimensionReport('runtime', {
@@ -3518,11 +3458,12 @@ it('producer projection cannot alter the owned working-memory report', () => {
         toolCallSummary: ['read a.ts'],
       },
     });
-    const projection = s.getDistilledForProducer('runtime');
-    if (!projection) {
+    const projection = s.getDimensionReport('runtime');
+    const keyFindings = projection?.workingMemoryDistilled?.keyFindings;
+    if (!projection || !keyFindings) {
       throw new Error('Fixture must provide projection');
     }
-    projection.keyFindings[0].finding = 'mutated producer fact';
+    keyFindings[0].finding = 'mutated producer fact';
     projection.referencedFiles.push('rogue.ts');
     expect(s.getDimensionReport('runtime')?.workingMemoryDistilled?.keyFindings?.[0].finding).toBe(
       'confirmed fact'
@@ -3532,7 +3473,8 @@ it('producer projection cannot alter the owned working-memory report', () => {
     s.dispose();
   }
 });
-it('context snapshot cannot alter the stored digest or submitted candidates', () => {
+it('session snapshot cannot alter the stored digest or submitted candidates', () => {
+  // buildContextSnapshot 已随 W2a-10 删除；digest 与已提交候选的对外快照只剩 toJSON()。
   const s = new SessionStore();
   try {
     s.storeDimensionReport('runtime', { digest: { summary: 'owned digest' } });
@@ -3541,30 +3483,47 @@ it('context snapshot cannot alter the stored digest or submitted candidates', ()
       subTopic: 'core',
       summary: 'owned',
     });
-    const projection = s.buildContextSnapshot('next');
-    projection.previousDimensions.runtime.summary = 'mutated digest';
-    projection.submittedCandidates[0].title = 'mutated candidate';
+    const projection = s.toJSON();
+    const digest = projection.dimensionReports.runtime.digest;
+    if (!digest) {
+      throw new Error('Fixture must provide a digest');
+    }
+    digest.summary = 'mutated digest';
+    projection.submittedCandidates.runtime[0].title = 'mutated candidate';
     expect(s.getDimensionReport('runtime')?.digest?.summary).toBe('owned digest');
     expect(s.toJSON().submittedCandidates.runtime[0].title).toBe('owned candidate');
   } finally {
     s.dispose();
   }
 });
-it('new report generations retain unrelated and independent addEvidence data', () => {
+/**
+ * addEvidence 已随 W2a-10 删除；不带 reportDimId 的“独立证据”现在只会来自旧版本写出的快照。
+ * 夹具按这种来源构造：在 toJSON() 快照的 evidenceStore 里追加一条没有归属的证据再经 fromJSON 恢复。
+ */
+function withIndependentEvidence(
+  store: SessionStore,
+  filePath: string,
+  evidence: { dimId: string; finding: string; importance: number }
+) {
+  const snapshot = store.toJSON();
+  const index = snapshot.evidenceStore ?? {};
+  index[filePath] = [...(index[filePath] ?? []), { ...evidence, timestamp: 1 }];
+  return SessionStore.fromJSON({ ...snapshot, evidenceStore: index });
+}
+it('new report generations retain unrelated and independent restored evidence', () => {
   const s = new SessionStore();
   try {
-    s.addEvidence('independent.ts', {
-      dimId: 'runtime',
-      finding: 'independent appendix',
-      importance: 6,
-    });
     s.storeDimensionReport('other', {
       findings: [{ finding: 'other report', evidence: 'other.ts:2', importance: 5 }],
     });
     s.storeDimensionReport('runtime', {
       findings: [{ finding: 'prior report', evidence: 'old.ts:3', importance: 8 }],
     });
-    const restored = SessionStore.fromJSON(s.toJSON());
+    const restored = withIndependentEvidence(s, 'independent.ts', {
+      dimId: 'runtime',
+      finding: 'independent appendix',
+      importance: 6,
+    });
     try {
       restored.storeDimensionReport('runtime', {
         findings: [{ finding: 'new report', evidence: 'new.ts:4', importance: 9 }],
@@ -3575,7 +3534,10 @@ it('new report generations retain unrelated and independent addEvidence data', (
           .map((x) => x.evidence.finding)
           .sort()
       ).toEqual(['independent appendix', 'new report', 'other report']);
-      expect(restored.getEvidenceForFile('new.ts')[0]).not.toHaveProperty('reportDimId');
+      // 对外查询剥离内部归属字段（getEvidenceForFile 已删除，改用 searchEvidence 观测）。
+      const [newEvidence] = restored.searchEvidence('new.ts');
+      expect(newEvidence?.filePath).toBe('new.ts');
+      expect(newEvidence?.evidence).not.toHaveProperty('reportDimId');
     } finally {
       restored.dispose();
     }
@@ -3586,11 +3548,18 @@ it('new report generations retain unrelated and independent addEvidence data', (
 it('legacy snapshots infer report ownership without deleting distinct independent evidence', () => {
   const s = new SessionStore();
   try {
-    s.addEvidence('old.ts', { dimId: 'runtime', finding: 'independent appendix', importance: 6 });
     s.storeDimensionReport('runtime', {
       findings: [{ finding: 'prior report', evidence: 'old.ts:3', importance: 8 }],
     });
     const legacy = s.toJSON();
+    // 旧快照里与报告同文件、但内容不同的独立证据（原由已删除的 addEvidence 写入）。
+    legacy.evidenceStore = {
+      ...legacy.evidenceStore,
+      'old.ts': [
+        { dimId: 'runtime', finding: 'independent appendix', importance: 6, timestamp: 1 },
+        ...(legacy.evidenceStore?.['old.ts'] ?? []),
+      ],
+    };
     for (const entries of Object.values(legacy.evidenceStore || {})) {
       for (const e of entries) {
         delete e.reportDimId;
@@ -3607,63 +3576,5 @@ it('legacy snapshots infer report ownership without deleting distinct independen
     }
   } finally {
     s.dispose();
-  }
-});
-it.each([
-  'fs',
-  'write-zone',
-] as const)('checkpoint write failure preserves the previous snapshot using %s', async (mode) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-cross-'));
-  const s = new SessionStore();
-  const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
-  try {
-    pathGuard.configure({ projectRoot: root, extraAllowPaths: [root] });
-    const wz =
-      mode === 'write-zone'
-        ? new WriteZone(new WorkspaceResolver({ projectRoot: root }))
-        : undefined;
-    s.storeDimensionReport('runtime', { analysisText: 'old valid state' });
-    await s.saveCheckpoint(root, wz);
-    const before = fs.readFileSync(target, 'utf8');
-    const write = fs.writeFileSync;
-    vi.spyOn(fs, 'writeFileSync').mockImplementation(((
-      p: fs.PathOrFileDescriptor,
-      ...args: unknown[]
-    ) => {
-      if (String(p).startsWith(`${target}.`)) {
-        write(p, 'partial-stage');
-        throw new Error('injected stage ENOSPC');
-      }
-      return write(p, ...(args as [string, fs.WriteFileOptions]));
-    }) as typeof fs.writeFileSync);
-    s.storeDimensionReport('runtime', { analysisText: 'new state' });
-    await expect(s.saveCheckpoint(root, wz)).rejects.toThrow('injected stage ENOSPC');
-    expect(fs.readFileSync(target, 'utf8')).toBe(before);
-    expect(fs.readdirSync(path.dirname(target))).toEqual(['session-store.json']);
-  } finally {
-    vi.restoreAllMocks();
-    s.dispose();
-    fs.rmSync(root, { recursive: true, force: true });
-  }
-});
-it('checkpoint rename failure is visible and preserves the previous file', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'alembic-r06-rename-'));
-  const s = new SessionStore();
-  const target = path.join(root, '.asd/bootstrap-checkpoint/session-store.json');
-  try {
-    s.storeDimensionReport('runtime', { analysisText: 'old' });
-    await s.saveCheckpoint(root);
-    const before = fs.readFileSync(target, 'utf8');
-    vi.spyOn(fs, 'renameSync').mockImplementation(() => {
-      throw new Error('rename denied');
-    });
-    s.storeDimensionReport('runtime', { analysisText: 'new' });
-    await expect(s.saveCheckpoint(root)).rejects.toThrow('rename denied');
-    expect(fs.readFileSync(target, 'utf8')).toBe(before);
-    expect(fs.readdirSync(path.dirname(target))).toEqual(['session-store.json']);
-  } finally {
-    vi.restoreAllMocks();
-    s.dispose();
-    fs.rmSync(root, { recursive: true, force: true });
   }
 });

@@ -145,75 +145,67 @@ describe('default tool pipeline assembly (L5-P47 / I45)', () => {
 
   it('runs the default observers on the routed envelope without touching MemoryCoordinator', async () => {
     const memory = new MemoryCoordinator();
-    try {
-      const { runtime, loopCtx, exec, trace, tracker } = makeProductionLikeRun({
-        memoryCoordinator: memory,
-      });
-      const outcome = await createToolPipeline().execute(terminalCall('git status'), {
-        runtime,
-        loopCtx,
-        iteration: 3,
-      });
-      expect(outcome.metadata.envelope?.ok).toBe(true);
-      expect(exec).toHaveBeenCalledOnce();
-      // 其余观察者仍消费同一个信封。
-      expect(tracker.recordToolCall).toHaveBeenCalledOnce();
-      expect(trace.recordToolCall).toHaveBeenCalledWith(
-        'terminal',
-        expect.anything(),
-        outcome.metadata.envelope,
-        true
-      );
-    } finally {
-      memory.dispose();
-    }
+    const { runtime, loopCtx, exec, trace, tracker } = makeProductionLikeRun({
+      memoryCoordinator: memory,
+    });
+    const outcome = await createToolPipeline().execute(terminalCall('git status'), {
+      runtime,
+      loopCtx,
+      iteration: 3,
+    });
+    expect(outcome.metadata.envelope?.ok).toBe(true);
+    expect(exec).toHaveBeenCalledOnce();
+    // 其余观察者仍消费同一个信封。
+    expect(tracker.recordToolCall).toHaveBeenCalledOnce();
+    expect(trace.recordToolCall).toHaveBeenCalledWith(
+      'terminal',
+      expect.anything(),
+      outcome.metadata.envelope,
+      true
+    );
   });
 });
 
 describe('runtime bridge request projection (L5-P47 / I45)', () => {
   it('does not project unread policyValidator, sessionToolCalls, currentRound or cache to the host', async () => {
     const memory = new MemoryCoordinator();
-    try {
-      const { runtime, loopCtx, requests, toolCalls, diagnostics } = makeProductionLikeRun({
-        memoryCoordinator: memory,
-      });
-      const map = vi.spyOn(toolCalls, 'map');
-      const outcome = await createToolPipeline().execute(terminalCall('git status'), {
-        runtime,
-        loopCtx,
-        iteration: 3,
-      });
+    const { runtime, loopCtx, requests, toolCalls, diagnostics } = makeProductionLikeRun({
+      memoryCoordinator: memory,
+    });
+    const map = vi.spyOn(toolCalls, 'map');
+    const outcome = await createToolPipeline().execute(terminalCall('git status'), {
+      runtime,
+      loopCtx,
+      iteration: 3,
+    });
 
-      expect(outcome.metadata.envelope?.ok).toBe(true);
-      expect(requests).toHaveLength(1);
-      const projected = requests[0]?.runtime ?? {};
-      expect('policyValidator' in projected).toBe(false);
-      expect('sessionToolCalls' in projected).toBe(false);
-      expect('currentRound' in projected).toBe(false);
-      // 历史调用不再在每次工具调用时被整体重映射。
-      expect(map).not.toHaveBeenCalled();
-      // 无消费者的 cache 端口随缓存层删除（W1-04，决定①）：宿主请求不再带 cache 键。
-      expect('cache' in projected).toBe(false);
-      // W2a-02：diagnostics 端口与没有读取方的 fileCache / dataRoot / logger / validator 不再进入
-      // 宿主请求（宿主 ToolContextFactory 与 src/tools 都不读它们）。
-      for (const key of ['diagnostics', 'fileCache', 'dataRoot', 'logger', 'validator']) {
-        expect({ key, projected: key in projected }).toEqual({ key, projected: false });
-      }
-      // 仍在使用的字段保持原样。
-      expect(projected.iteration).toBe(3);
-      expect(projected.memoryCoordinator).toBe(memory);
-      expect(projected.agentId).toBe('dead-link-runtime');
-      // 逐调用诊断不经宿主请求，而由 runtimeBridge 直接写入本次循环的收集器。
-      expect(diagnostics.toJSON().toolCalls).toEqual([
-        expect.objectContaining({
-          tool: 'terminal',
-          callId: outcome.metadata.envelope?.callId,
-          status: 'success',
-          surface: 'runtime',
-        }),
-      ]);
-    } finally {
-      memory.dispose();
+    expect(outcome.metadata.envelope?.ok).toBe(true);
+    expect(requests).toHaveLength(1);
+    const projected = requests[0]?.runtime ?? {};
+    expect('policyValidator' in projected).toBe(false);
+    expect('sessionToolCalls' in projected).toBe(false);
+    expect('currentRound' in projected).toBe(false);
+    // 历史调用不再在每次工具调用时被整体重映射。
+    expect(map).not.toHaveBeenCalled();
+    // 无消费者的 cache 端口随缓存层删除（W1-04，决定①）：宿主请求不再带 cache 键。
+    expect('cache' in projected).toBe(false);
+    // W2a-02：diagnostics 端口与没有读取方的 fileCache / dataRoot / logger / validator 不再进入
+    // 宿主请求（宿主 ToolContextFactory 与 src/tools 都不读它们）。
+    for (const key of ['diagnostics', 'fileCache', 'dataRoot', 'logger', 'validator']) {
+      expect({ key, projected: key in projected }).toEqual({ key, projected: false });
     }
+    // 仍在使用的字段保持原样。
+    expect(projected.iteration).toBe(3);
+    expect(projected.memoryCoordinator).toBe(memory);
+    expect(projected.agentId).toBe('dead-link-runtime');
+    // 逐调用诊断不经宿主请求，而由 runtimeBridge 直接写入本次循环的收集器。
+    expect(diagnostics.toJSON().toolCalls).toEqual([
+      expect.objectContaining({
+        tool: 'terminal',
+        callId: outcome.metadata.envelope?.callId,
+        status: 'success',
+        surface: 'runtime',
+      }),
+    ]);
   });
 });

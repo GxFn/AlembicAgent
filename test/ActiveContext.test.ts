@@ -12,6 +12,19 @@ import type { ToolContext } from '../src/tools/kernel/registry.js';
 import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js';
 import { createTempProject } from './helpers/tempProject.js';
 
+/**
+ * 经生产路径种入计划：PlanTracker 发出的 expectPlan 授权 + AgentRuntime 调用的 extractAndSetPlan。
+ * 取代 W2a-10 删除的 setPlan/updatePlan（已有计划时同样把旧计划推入计划历史）；文本不被接受时
+ * 直接抛错，避免夹具静默落空。删除旧方法前已逐次对照：全部夹具解析出的步骤、状态与轮次都与旧
+ * 种法一致，只有带“我的探索计划：”标记的文本，计划正文不再含标记行。
+ */
+function seedPlan(trace: ActiveContext, text: string, iteration: number): void {
+  trace.expectPlan();
+  if (!trace.extractAndSetPlan(text, iteration)) {
+    throw new Error(`seedPlan rejected plan text: ${JSON.stringify(text)}`);
+  }
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -88,8 +101,16 @@ describe('ActiveContext observation retention configuration', () => {
       new ActiveContext({ maxRecentRounds }),
       coordinator.createDimensionScope('scope', { maxRecentRounds }),
     ]) {
+      // 旧 WM 入口 observe 已删除（W2a-10），观察统一经 recordToolCall 进入滑动窗口。
       for (let round = 1; round <= 4; round++) {
-        context.observe('code', { path: 'src/fixture.ts', content: 'fixture' }, round);
+        context.startRound(round);
+        context.recordToolCall(
+          'code',
+          { action: 'read', path: 'src/fixture.ts' },
+          { path: 'src/fixture.ts', content: 'fixture' },
+          true
+        );
+        context.endRound();
       }
       expect(context.distill()).toMatchObject({ totalObservations: 4, compressedCount });
     }
@@ -430,9 +451,10 @@ describe('ActiveContext envelope-aware observation compression (L6-P10)', () => 
     expect(displayedRange).toContain('first=3 last=4 shown=2');
   });
 
-  it('never throws from recordToolCall/observe/distill when a direct host result cannot be serialized', () => {
-    // 只有绕过适配器直接调用 recordToolCall/observe 的宿主才会交来这些值（适配器会先替换为占位符），
+  it('never throws from recordToolCall/distill when a direct host result cannot be serialized', () => {
+    // 只有绕过适配器直接调用 recordToolCall 的宿主才会交来这些值（适配器会先替换为占位符），
     // 所以这里刻意不用 runtimeBridge 夹具：被测的就是“非信封、不可序列化”的直连输入。
+    // 旧 WM 入口 observe 已删除（W2a-10），原先经它写入的两条观察改走 recordToolCall。
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
     const circular: Record<string, unknown> = { name: 'loop' };
     circular.self = circular;
@@ -463,14 +485,16 @@ describe('ActiveContext envelope-aware observation compression (L6-P10)', () => 
       // 无策略工具：defaultCompress 直接抛出。
       context.recordToolCall('knowledge', { action: 'search' }, circular, true);
       context.recordToolCall('terminal', { command: 'pwd' }, throwingGetter, true);
-      context.observe('meta', unprintable, 1);
-      context.observe('meta', throwingStatus, 1);
+      context.recordToolCall('meta', {}, unprintable, true);
+      context.recordToolCall('meta', {}, throwingStatus, true);
     }).not.toThrow();
     context.endRound();
 
     // 窗口未滑出的观察在 distill 时压缩，同样不能抛。
     const recent = new ActiveContext({ maxRecentRounds: 3 });
-    recent.observe('knowledge', circular, 1);
+    recent.startRound(1);
+    recent.recordToolCall('knowledge', { action: 'search' }, circular, true);
+    recent.endRound();
     expect(() => recent.distill()).not.toThrow();
     expect(recent.distill().toolCallSummary[0]).toMatch(
       /^\[knowledge\] \[unserializable object keys=name,self: /
@@ -832,19 +856,10 @@ describe('working memory ownership and read budgets', () => {
 
   it('does not let getPlan observers alter keywords consumed by exploration tracking', () => {
     const context = new ActiveContext();
-    context.setPlan('1. Read AlphaBeta module\n2. Inspect DeltaGamma calls', 1);
+    seedPlan(context, '1. Read AlphaBeta module\n2. Inspect DeltaGamma calls', 1);
     const plan = context.getPlan();
     plan?.steps[0].keywords.push('observer-mutation');
     expect(context.getPlanStepsMutable()[0].keywords).not.toContain('observer-mutation');
-  });
-
-  it('owns restored snapshots after caller input is mutated', () => {
-    const original = new ActiveContext();
-    original.noteKeyFinding('Verified result', 'E-1=src/a.ts', 9, 1, ['E-1']);
-    const input = structuredClone(original.toJSON());
-    const restored = ActiveContext.fromJSON(input);
-    input.scratchpad[0].evidenceRefs?.splice(0, 1, 'E-forged');
-    expect(restored.distill().keyFindings[0].evidenceRefs).toEqual(['E-1']);
   });
 
   it('preserves the real note_finding receipt if a logging observer fails after mutation', async () => {
@@ -919,18 +934,28 @@ describe('memory budgets and snapshot regression controls', () => {
     expect(context.toJSON()).toEqual(before);
   });
 
-  it('keeps nested action and plan history snapshots independent while mutable plan port remains intentional', () => {
+  it('keeps nested action and plan snapshots independent while mutable plan port remains intentional', () => {
     const context = new ActiveContext();
-    context.setPlan('1. Read AlphaBeta module\n2. Inspect DeltaGamma calls', 1);
-    context.updatePlan('1. Read NewModule scope\n2. Inspect OtherModule calls', 2);
-    const history = context.getPlanHistory();
-    history[0].steps[0].keywords.push('untrusted');
-    expect(context.getPlanHistory()[0].steps[0].keywords).not.toContain('untrusted');
+    seedPlan(context, '1. Read AlphaBeta module\n2. Inspect DeltaGamma calls', 1);
+    seedPlan(context, '1. Read NewModule scope\n2. Inspect OtherModule calls', 2);
+    // getPlanHistory 已删除（W2a-10）：计划历史只经 toJSON().planHistory 暴露条数，
+    // 快照里的计划是副本，改写它不影响探索追踪读取的关键词。
+    const snapshot = context.toJSON();
+    expect(snapshot.planHistory).toBe(1);
+    snapshot.plan?.steps[0].keywords.push('untrusted');
+    expect(context.getPlanStepsMutable()[0].keywords).not.toContain('untrusted');
     context.startRound(2);
-    context.addAction('code', { action: 'read', params: { path: 'src/a.ts' } });
+    // 旧 RT 入口 addAction 已删除（W2a-10）：动作统一由 recordToolCall 写入，并带上真实回执 ok。
+    context.recordToolCall(
+      'code',
+      { action: 'read', params: { path: 'src/a.ts' } },
+      'export const a = 1;',
+      true
+    );
     const actions = context.getCurrentRoundActions();
     (actions[0].params.params as { path: string }).path = 'src/changed.ts';
     expect(context.getCurrentRoundActions()[0].params.params).toEqual({ path: 'src/a.ts' });
+    expect(context.getCurrentRoundActions()[0].ok).toBe(true);
     context.getPlanStepsMutable()[0].status = 'done';
     expect(context.getPlan()?.steps[0].status).toBe('done');
   });
@@ -1157,7 +1182,7 @@ describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () 
       '直接提交 FooService 相关候选',
       '输出 dimensionDigest 收尾',
     ]);
-    expect(context.getPlanHistory()).toHaveLength(1);
+    expect(context.toJSON().planHistory).toBe(1);
     expect(context.getPlan()?.lastUpdatedAtIteration).toBe(9);
     expect(
       debugMessages(debug).some((m) => m.includes('plan overridden under authorization'))
@@ -1172,7 +1197,7 @@ describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () 
     expect(context.extractAndSetPlan(REFLECTION, 5)).toBe(false);
 
     expect(planDescriptions(context).join('|')).toContain('FooService');
-    expect(context.getPlanHistory()).toHaveLength(0);
+    expect(context.toJSON().planHistory).toBe(0);
     expect(
       debugMessages(debug).some((m) => m.includes('plan update rejected without authorization'))
     ).toBe(true);
@@ -1215,7 +1240,7 @@ describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () 
     expect(context.extractAndSetPlan(REFLECTION, 10)).toBe(false);
 
     expect(planDescriptions(context).join('|')).not.toContain('最重要的发现');
-    expect(context.getPlanHistory()).toHaveLength(0);
+    expect(context.toJSON().planHistory).toBe(0);
     expect(debugMessages(debug).some((m) => m.includes('plan authorization expired'))).toBe(true);
   });
 
@@ -1262,7 +1287,7 @@ describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () 
 
     expect(planDescriptions(context).join('|')).toContain('FooService');
     expect(planDescriptions(context).join('|')).not.toContain('最重要的发现');
-    expect(context.getPlanHistory()).toHaveLength(0);
+    expect(context.toJSON().planHistory).toBe(0);
     const messages = debugMessages(debug);
     expect(
       messages.some(
@@ -1326,12 +1351,18 @@ describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () 
 
   it('does not leak a pending authorization across clear()', () => {
     const context = new ActiveContext();
-    context.setPlan(PLAN, 1);
+    seedPlan(context, PLAN, 1);
     context.expectPlan();
     context.clear();
-    context.setPlan(PLAN, 1);
 
-    expect(context.extractAndSetPlan(REFLECTION, 3)).toBe(false);
+    // setPlan 已删除（W2a-10），重建计划的 seedPlan 会自己授权并消费，不能再拿来探测泄漏。
+    // 改用只有授权轮才接受的单步、无标记短文本：clear() 之前的授权若泄漏，它会被采纳为计划。
+    expect(context.extractAndSetPlan('1. 读取 FooService 并提交候选', 3)).toBe(false);
+    expect(context.getPlan()).toBeNull();
+
+    // 清空后重新建立的计划仍不能被未授权的反思编号回答覆盖。
+    seedPlan(context, PLAN, 4);
+    expect(context.extractAndSetPlan(REFLECTION, 5)).toBe(false);
     expect(planDescriptions(context).join('|')).toContain('FooService');
   });
 
@@ -1355,14 +1386,14 @@ describe('ActiveContext plan extraction authorization and parsing (L6-P11)', () 
 
     // 授权重规划只给 1 步
     const replanned = new ActiveContext();
-    replanned.setPlan(PLAN, 1);
+    seedPlan(replanned, PLAN, 1);
     replanned.startRound(9);
     replanned.expectPlan();
     expect(
       replanned.extractAndSetPlan('更新计划：\n1. 直接提交 FooService 相关候选并输出 digest', 9)
     ).toBe(true);
     expect(planDescriptions(replanned)).toEqual(['直接提交 FooService 相关候选并输出 digest']);
-    expect(replanned.getPlanHistory()).toHaveLength(1);
+    expect(replanned.toJSON().planHistory).toBe(1);
   });
 
   it('keeps rejecting single numbered items without authorization or marker, and question-only lists', () => {

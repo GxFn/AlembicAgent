@@ -128,18 +128,20 @@ describe('SessionStore lifecycle without the cleanup timer', () => {
     expect(cleanupTimerCount()).toBe(before);
   });
 
-  it('MemoryCoordinator.dispose leaves an injected SessionStore to its host owner', () => {
+  it('leaves an injected SessionStore to its host owner now that MemoryCoordinator has no dispose', () => {
     const store = new SessionStore();
+    const coordinator = new MemoryCoordinator({ sessionStore: store });
     try {
       store.storeDimensionReport('dim', { analysisText: 'owned by host' });
-      const coordinator = new MemoryCoordinator({ sessionStore: store });
+      // MemoryCoordinator.dispose 已随 W2a-10 删除（总控裁定：宿主会话结束时只 dispose SessionStore，
+      // L6-P28）。coordinator 只按引用持有注入的 SessionStore，从不替宿主释放它。
+      expect('dispose' in coordinator).toBe(false);
       expect(coordinator.getSessionStore()).toBe(store);
-      coordinator.dispose();
-      // 拥有关系属宿主：coordinator 只断开引用，宿主仍可读取报告。
-      expect(coordinator.getSessionStore()).toBeNull();
       expect(store.getDimensionReport('dim')?.analysisText).toBe('owned by host');
     } finally {
       store.dispose();
     }
+    // 释放只经宿主持有的 SessionStore：coordinator 看到的是同一个已清空的实例。
+    expect(coordinator.getSessionStore()?.getCompletedDimensions()).toEqual([]);
   });
 });

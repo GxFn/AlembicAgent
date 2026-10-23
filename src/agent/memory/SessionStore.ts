@@ -12,21 +12,19 @@
  *   EpisodicMemory.js → 全部维度报告/证据/反思逻辑
  *
  * 新增能力 (vs 原模块):
- *   - getDistilledForProducer(dimId): Producer 专用蒸馏上下文 (B2 fix)
  *   - buildContextForDimension 增强: 消费 workingMemoryDistilled (B1 fix, 已在 EpisodicMemory 修复)
  *   - 统一的 getStats(): 维度统计 (+ 过渡期全零的 cache 子对象)
  *
  * 生命周期: 与 Bootstrap 会话一致；不注册任何后台定时器，宿主在会话结束时调用 dispose() 释放数据。
- * 持久化: 通过 saveCheckpoint / loadCheckpoint 实现断点续传。
+ * 持久化: 只提供 toJSON() / fromJSON() 快照；宿主断点续跑自行保存快照并经 fromJSON() 恢复。
+ *   原先写入项目 .asd 目录的检查点文件链（saveCheckpoint / loadCheckpoint 及其原子写）
+ *   与无生产调用的 addEvidence / getEvidenceForFile / buildContextSnapshot / getDistilledForProducer
+ *   已随 W2a-10（审阅包 L6-P25）删除。
  *
  * @module SessionStore
  */
 
-import { randomUUID } from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
 import type { Disposable } from '@alembic/core/events';
-import type { WriteZone } from '@alembic/core/io';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 import { estimateTokens, truncateToTokenBudget } from '#shared/tokenUtils.js';
@@ -78,7 +76,10 @@ export interface Finding {
   importance: number;
   dimId?: string;
   timestamp?: number;
-  /** 检查点中的派生索引归属；独立 addEvidence 不接受此字段。 */
+  /**
+   * 快照中的派生索引归属（由 storeDimensionReport 写入）；对外的证据查询会剥离此字段。
+   * 缺少该字段的条目是旧快照恢复出的独立证据，换代时不随报告删除。
+   */
   reportDimId?: string;
 }
 
@@ -282,7 +283,7 @@ export class SessionStore implements Disposable {
       },
     }).dimensionReports[dimId];
     // 校验通过后才开始改状态：坏报告抛错时旧一代报告与索引保持不变。
-    // 报告及其派生索引是一代数据；只删本维报告产生的索引，保留独立追加证据。
+    // 报告及其派生索引是一代数据；只删本维报告产生的索引，保留其它报告与旧快照恢复的独立证据。
     for (const [file, entries] of this.#evidenceStore) {
       const kept = entries.filter((entry) => entry.reportDimId !== dimId);
       if (kept.length > 0) {
@@ -335,29 +336,6 @@ export class SessionStore implements Disposable {
   // ═══════════════════════════════════════════════════════
   // §2: Evidence Store
   // ═══════════════════════════════════════════════════════
-
-  /**
-   * 直接向证据库追加一条文件证据（不经维度报告）。
-   * @deprecated 生产中没有调用方（证据随 storeDimensionReport 的 findings 写入）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  addEvidence(filePath: string, evidence: Omit<Finding, 'timestamp' | 'reportDimId'>) {
-    let evidenceList = this.#evidenceStore.get(filePath);
-    if (!evidenceList) {
-      evidenceList = [];
-      this.#evidenceStore.set(filePath, evidenceList);
-    }
-    const owned = structuredClone(evidence) as Finding;
-    delete owned.reportDimId;
-    evidenceList.push({ ...owned, timestamp: Date.now() });
-  }
-
-  /**
-   * 读取某个文件的全部证据副本。
-   * @deprecated 生产中没有调用方（检索走 searchEvidence）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getEvidenceForFile(filePath: string): Finding[] {
-    return (this.#evidenceStore.get(filePath) || []).map(publicEvidence);
-  }
 
   /**
    * 按文件路径或 finding 文本（不区分大小写的子串匹配）检索证据，可按 dimId 过滤。
@@ -677,176 +655,6 @@ export class SessionStore implements Disposable {
     return result;
   }
 
-  /**
-   * 前序维度 digest 与已提交候选的快照（旧 DimensionContext 返回格式）。
-   * @deprecated 生产中没有调用方（提示装配走 buildContextForDimension）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  buildContextSnapshot(currentDimId: string) {
-    const previousDimensions: Record<string, DimensionDigest> = Object.create(null);
-    for (const [dimId, report] of this.#dimensionReports) {
-      if (dimId === currentDimId) {
-        continue;
-      }
-      previousDimensions[dimId] = report.digest || {
-        summary: report.analysisText?.substring(0, 300) || '',
-        candidateCount: report.candidatesSummary?.length || 0,
-        keyFindings: report.findings?.map((f) => f.finding) || [],
-        crossRefs: {},
-        gaps: [],
-      };
-    }
-    const submittedCandidates: CandidateSummary[] = [];
-    for (const [, candidates] of this.#submittedCandidates) {
-      submittedCandidates.push(...candidates);
-    }
-    return structuredClone({ previousDimensions, submittedCandidates });
-  }
-
-  // ═══════════════════════════════════════════════════════
-  // §7: 蒸馏上下文 (for PipelineStrategy produce 阶段)
-  // ═══════════════════════════════════════════════════════
-
-  /**
-   * 获取维度的蒸馏上下文 (供 Producer 使用)
-   * @returns 维度蒸馏上下文 { keyFindings, toolCallSummary, referencedFiles } 的深拷贝；
-   *   该维度尚无报告时返回 null
-   * @deprecated 生产中没有调用方（produce 阶段从分析产物取发现）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getDistilledForProducer(dimId: string) {
-    const report = this.#dimensionReports.get(dimId);
-    if (!report) {
-      return null;
-    }
-
-    return structuredClone({
-      keyFindings: report.workingMemoryDistilled?.keyFindings || [],
-      toolCallSummary: report.workingMemoryDistilled?.toolCallSummary || [],
-      referencedFiles: report.referencedFiles || [],
-    });
-  }
-
-  // ═══════════════════════════════════════════════════════
-  // §8: 持久化 (断点续传)
-  // ═══════════════════════════════════════════════════════
-
-  /**
-   * 把会话快照写到 .asd/bootstrap-checkpoint/session-store.json（有 WriteZone 时写到其 data 区）。
-   * @deprecated 生产中没有调用方（唯一调用方 MemoryCoordinator.checkpoint 也无人调用，且不传 WriteZone）；
-   *   注意与 loadCheckpoint 不对称：带 WriteZone 保存的文件 loadCheckpoint 只按 projectRoot 读取。
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  async saveCheckpoint(projectRoot: string, wz?: WriteZone) {
-    const relative = '.asd/bootstrap-checkpoint/session-store.json';
-    const target = wz?.data(relative).absolute ?? path.join(projectRoot, relative);
-    const temporaryRelative = `${relative}.${randomUUID()}.tmp`;
-    const temporary =
-      wz?.data(temporaryRelative).absolute ?? path.join(projectRoot, temporaryRelative);
-    try {
-      const snapshot = this.toJSON();
-      const data = {
-        ...snapshot,
-        version: 2,
-        savedAt: Date.now(),
-        dimensionReports: Object.fromEntries(
-          Object.entries(snapshot.dimensionReports).map(([id, report]) => [
-            id,
-            { ...report, analysisText: report.analysisText.substring(0, 500) },
-          ])
-        ),
-        evidenceIndex: Object.keys(snapshot.evidenceStore || {}),
-      };
-      const content = JSON.stringify(data, null, 2);
-      // 同目录临时文件写完才替换；失败不能破坏上一次可恢复检查点。
-      if (wz) {
-        wz.writeFile(wz.data(temporaryRelative), content);
-        wz.rename(wz.data(temporaryRelative), wz.data(relative));
-      } else {
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.writeFileSync(temporary, content, 'utf-8');
-        fs.renameSync(temporary, target);
-      }
-      this.#log('info', `[SessionStore] Checkpoint saved: ${this.#dimensionReports.size} reports`);
-    } catch (err: unknown) {
-      this.#log(
-        'warn',
-        `[SessionStore] Failed to save checkpoint; previous file retained: ${err instanceof Error ? err.message : String(err)}`
-      );
-      throw err instanceof Error
-        ? err
-        : new Error('Session checkpoint write failed', { cause: err });
-    } finally {
-      try {
-        if (wz) {
-          if (fs.existsSync(temporary)) {
-            wz.remove(wz.data(temporaryRelative));
-          }
-        } else {
-          fs.rmSync(temporary, { force: true });
-        }
-      } catch (err: unknown) {
-        this.#log(
-          'warn',
-          `[SessionStore] temporary checkpoint cleanup failed: ${err instanceof Error ? err.message : String(err)}`
-        );
-      }
-    }
-  }
-
-  /**
-   * 从 projectRoot 下的检查点恢复（新格式优先，回退旧版 episodic-memory.json；超过 1 小时视为过期）。
-   * @deprecated 生产中没有调用方（唯一调用方 MemoryCoordinator.restore 也无人调用；宿主经 fromJSON 恢复）；
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  async loadCheckpoint(projectRoot: string) {
-    // Try new format first, then legacy
-    const newPath = path.join(projectRoot, '.asd', 'bootstrap-checkpoint', 'session-store.json');
-    const legacyPath = path.join(
-      projectRoot,
-      '.asd',
-      'bootstrap-checkpoint',
-      'episodic-memory.json'
-    );
-    const checkpointPath = fs.existsSync(newPath) ? newPath : legacyPath;
-
-    try {
-      if (!fs.existsSync(checkpointPath)) {
-        return false;
-      }
-
-      const raw = fs.readFileSync(checkpointPath, 'utf-8');
-      const data = JSON.parse(raw);
-
-      if (data.version !== 1 && data.version !== 2) {
-        this.#log('warn', `[SessionStore] Unsupported checkpoint version: ${data.version}`);
-        return false;
-      }
-      if (Date.now() - data.savedAt > 3600_000) {
-        this.#log('info', `[SessionStore] Checkpoint expired (>1h), ignoring`);
-        return false;
-      }
-
-      if (typeof data.savedAt !== 'number' || !Number.isFinite(data.savedAt)) {
-        throw new Error('SessionStore checkpoint savedAt must be finite');
-      }
-      const validated = validateSessionStoreShape({
-        ...data,
-        projectContext: data.projectContext ?? this.#projectContext,
-      });
-      this.#restoreSnapshot(validated);
-
-      this.#log('info', `[SessionStore] Checkpoint loaded: ${this.#dimensionReports.size} reports`);
-      return true;
-    } catch (err: unknown) {
-      // 恢复失败（文件读写、JSON 解析或快照校验）一律降级为“无检查点”，由调用方重跑相应维度；
-      // 非 Error 抛出值按原值输出，避免日志只剩 undefined。
-      this.#log(
-        'warn',
-        `[SessionStore] Failed to load checkpoint: ${err instanceof Error ? err.message : String(err)}`
-      );
-      return false;
-    }
-  }
-
   // ═══════════════════════════════════════════════════════
   // §9: 序列化
   // ═══════════════════════════════════════════════════════
@@ -871,7 +679,10 @@ export class SessionStore implements Disposable {
     return store;
   }
 
-  /** 验证/克隆已在外部完成；在任何字段替换前构造所有集合，失败不污染当前会话。 */
+  /**
+   * 验证/克隆已在外部完成；在任何字段替换前构造所有集合，失败不污染当前会话。
+   * 唯一调用方是 fromJSON（作用于新建实例）；原先在已有实例上恢复的 loadCheckpoint 已随 W2a-10 删除。
+   */
   #restoreSnapshot(snapshot: SessionStoreSerialized): void {
     const evidence: Record<string, Finding[]> = Object.assign(
       Object.create(null),

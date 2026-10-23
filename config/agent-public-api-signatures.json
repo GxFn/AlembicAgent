@@ -1798,7 +1798,7 @@
     }
   },
   "deprecatedPendingNarrowing": {
-    "description": "L6-P25（C63/C15/C48）：无生产消费者、已在公开面标 @deprecated 但尚未删除的符号登记。待决事项②“公开面收窄”未答复前只加废弃标注：上面的 stableExportSignatures（名字、运行时种类、signatureHash）保持不变；W2a-09 已删除 SEARCH_TOOLS、createGenerateStrategy、extractHighPriorityFindings、ANALYST_TOOLS、PRODUCER_TOOLS、DimensionFlushManifest 及 ConversationStore/PlanTracker/ExplorationTracker/BudgetInput 的登记成员并移出本登记。bindings 是签名快照内的运行时绑定，types 是纯类型导出，members 是公开类/构造参数类型上的成员。test/contract-surface.test.ts 校验本登记与源码 JSDoc 双向一致。",
+    "description": "L6-P25（C63/C15/C48）：无生产消费者、已在公开面标 @deprecated 但尚未删除的符号登记。待决事项②“公开面收窄”未答复前只加废弃标注：上面的 stableExportSignatures（名字、运行时种类、signatureHash）保持不变；W2a-09 已删除 SEARCH_TOOLS、createGenerateStrategy、extractHighPriorityFindings、ANALYST_TOOLS、PRODUCER_TOOLS、DimensionFlushManifest 及 ConversationStore/PlanTracker/ExplorationTracker/BudgetInput 的登记成员并移出本登记。W2a-10 已删除 ActiveContext、ActiveContextOptions、DimensionScopeConfig、SessionStore、PersistentMemory、MemoryConsolidator 的全部登记成员与 MemoryCoordinator 的 checkpoint、completeDimension、completeSession、dispose、extractFromConversation、getPersistentMemory、restore 并移出本登记（只删成员，运行时绑定与签名快照不变）。bindings 是签名快照内的运行时绑定，types 是纯类型导出，members 是公开类/构造参数类型上的成员。test/contract-surface.test.ts 校验本登记与源码 JSDoc 双向一致。",
     "removalPrecondition": "随事项②收窄批次逐项删除；删除前须附 src、test、宿主生产代码与宿主测试的零引用扫描；名字与运行时种类在删除前保持冻结。删除后同步本文件 stableExportSignatures 与本登记。",
     "bindings": [
       {
@@ -1821,48 +1821,18 @@
     "types": [],
     "members": [
       {
-        "owner": "ActiveContext",
-        "source": "src/agent/memory/ActiveContext.ts",
-        "members": [
-          "addAction",
-          "addObservation",
-          "fromJSON",
-          "getCurrentIteration",
-          "getHighPriorityFindings",
-          "getPlanHistory",
-          "getThoughts",
-          "observe",
-          "setPlan",
-          "updatePlan"
-        ]
-      },
-      {
-        "owner": "ActiveContextOptions",
-        "source": "src/agent/memory/ActiveContext.ts",
-        "members": [
-          "lightweight"
-        ]
-      },
-      {
         "owner": "MemoryCoordinator",
         "source": "src/agent/memory/MemoryCoordinator.ts",
         "members": [
           "_lastSurplus",
           "buildMemoryPrompt",
           "buildStaticMemoryPrompt",
-          "checkpoint",
-          "completeDimension",
-          "completeSession",
           "configure",
-          "dispose",
-          "extractFromConversation",
           "getBudgetAllocation",
           "getConversationLog",
           "getMessageBudget",
-          "getPersistentMemory",
           "getTotalBudget",
-          "onConversationUpdated",
-          "restore"
+          "onConversationUpdated"
         ]
       },
       {
@@ -1870,39 +1840,6 @@
         "source": "src/agent/memory/MemoryCoordinator.ts",
         "members": [
           "conversationLog"
-        ]
-      },
-      {
-        "owner": "DimensionScopeConfig",
-        "source": "src/agent/memory/MemoryCoordinator.ts",
-        "members": [
-          "lightweight"
-        ]
-      },
-      {
-        "owner": "SessionStore",
-        "source": "src/agent/memory/SessionStore.ts",
-        "members": [
-          "addEvidence",
-          "buildContextSnapshot",
-          "getDistilledForProducer",
-          "getEvidenceForFile",
-          "loadCheckpoint",
-          "saveCheckpoint"
-        ]
-      },
-      {
-        "owner": "PersistentMemory",
-        "source": "src/agent/memory/PersistentMemory.ts",
-        "members": [
-          "migrateFromLegacy"
-        ]
-      },
-      {
-        "owner": "MemoryConsolidator",
-        "source": "src/agent/memory/MemoryConsolidator.ts",
-        "members": [
-          "migrateFromLegacy"
         ]
       }
     ]

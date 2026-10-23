@@ -29,11 +29,17 @@ import {
   readPersistentMemorySection,
 } from './MemoryPrompt.js';
 import { type MemoryReadOptions, reportMemoryRead } from './MemoryReadPolicy.js';
-import type { DimensionReportInput, SessionStore } from './SessionStore.js';
+import type { SessionStore } from './SessionStore.js';
 
 // ── 类型定义 ──
 
-/** PersistentMemory 接口 (声明式) */
+/**
+ * PersistentMemory 接口 (声明式)
+ *
+ * append 的唯一调用方 extractFromConversation 已随 W2a-10 删除，本类当前只经 MemoryPromptPort
+ * 读取持久记忆；append 仍留在端口形状里，是为了不在本批改变构造参数 persistentMemory 的公开类型
+ * （删除它会放宽宿主可传入的对象形状，属于未批准的类型变化）。
+ */
 interface PersistentMemoryLike extends MemoryPromptPort {
   append(entry: { type: string; content: string; source: string; importance: number }): void;
 }
@@ -80,14 +86,8 @@ export interface StaticMemoryOptions extends MemoryReadOptions {
   scopeId?: string;
 }
 
-/** 维度 scope 配置 */
+/** 维度 scope 配置（W2a-10 删除了 src 与宿主都不传的跳过滑动窗口开关，只剩观察保留轮数） */
 export interface DimensionScopeConfig {
-  /**
-   * 轻量模式：透传给 ActiveContext（跳过观察滑动窗口与 buildContext 输出）。
-   * @deprecated src 与宿主调用 createDimensionScope 都不传，生产恒为 false；
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  lightweight?: boolean;
   maxRecentRounds?: number;
 }
 
@@ -129,26 +129,8 @@ export interface MemoryWriteFailureDiagnostic {
 
 // ── 预算分配策略 (§4.1) ──
 
-// ── 写入路由: 规则匹配模式 ──
-
-const PREFERENCE_PATTERNS = [
-  /我们(项目|团队)?(不用|不使用|禁止|避免|偏好|习惯|规范是)/,
-  /以后(都|请|要)/,
-  /记住/,
-  /we\s+(don'?t|never|always|prefer|avoid)\s+use/i,
-  /remember\s+(to|that)/i,
-  /our\s+(convention|standard|rule)\s+is/i,
-];
-
-const DECISION_PATTERNS = [
-  /决定(了|用|采用|使用)/,
-  /(确认|同意|通过)(了|这个方案|审核)/,
-  /就(这样|这么)(做|定|办)/,
-  /let'?s\s+(go\s+with|use|adopt)/i,
-  /approved|confirmed|decided/i,
-];
-
-const MEMORY_TAG_REGEX = /\[MEMORY:(\w+)\]\s*([\s\S]*?)\s*\[\/MEMORY\]/g;
+// 对话写入路由（偏好/决策规则匹配与 [MEMORY] 标签提取）随唯一入口 extractFromConversation
+// 一并删除（W2a-10，审阅包 L6-P25）：src 与宿主都不调用，对话记忆不经此写入 PersistentMemory。
 
 /** catch (err: unknown) 的日志文本：非 Error 的抛出值也要留下可读内容，而不是 "undefined"。 */
 function errorMessage(err: unknown): string {
@@ -182,6 +164,11 @@ export class MemoryCoordinator {
   #currentScopeId: string | null;
 
   #logger: ReturnType<typeof Logger.getInstance>;
+  /**
+   * 持久记忆写入失败的诊断。唯一写入路径 extractFromConversation 已随 W2a-10 删除，当前没有任何
+   * 写入者，getDiagnostics() 恒返回空列表；getDiagnostics 与 MemoryWriteFailureDiagnostic 类型不在
+   * 本批收窄清单内，保留原样，去留随后续公开面收窄批次决定。
+   */
   #writeFailures: MemoryWriteFailureDiagnostic[] = [];
   /** session-store-missing 降级每个 coordinator 只 warn 一次，之后记 debug（scan 每次调用都会命中）。 */
   #evidenceStoreMissingWarned = false;
@@ -469,68 +456,6 @@ export class MemoryCoordinator {
     }
   }
 
-  /**
-   * 从对话中提取记忆
-   *
-   * 写入路由 (WriteRouter):
-   *   - 规则 1: 只在 user 源触发规则匹配 (B4 fix)
-   *   - 规则 2: [MEMORY] 标签提取 (所有源)
-   *
-   * @param prompt 用户输入
-   * @param reply AI 回复
-   * @deprecated src 与宿主都不调用（对话记忆不经此写入 PersistentMemory）；
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  extractFromConversation(prompt: string, reply: string, source: 'user' | 'system') {
-    // §7.6 step 4: 只写 PersistentMemory (不再双写 Memory.js)
-    if (!this.#persistentMemory) {
-      return;
-    }
-
-    try {
-      // ── 层 1: 规则快速匹配 (仅 user 源) ──
-      if (source === 'user') {
-        if (PREFERENCE_PATTERNS.some((p) => p.test(prompt))) {
-          this.#persistentMemory.append({
-            type: 'preference',
-            content: prompt.substring(0, 200),
-            source,
-            importance: 5,
-          });
-        }
-
-        if (DECISION_PATTERNS.some((p) => p.test(prompt))) {
-          this.#persistentMemory.append({
-            type: 'fact',
-            content: prompt.substring(0, 200),
-            source,
-            importance: 7,
-          });
-        }
-      }
-
-      // ── 层 2: [MEMORY] 标签提取 (所有源) ──
-      if (reply) {
-        const regex = new RegExp(MEMORY_TAG_REGEX.source, MEMORY_TAG_REGEX.flags);
-        let match: RegExpExecArray | null;
-        while ((match = regex.exec(reply)) !== null) {
-          const type = match[1];
-          const content = match[2].trim();
-          if (content && ['preference', 'decision', 'context'].includes(type)) {
-            this.#persistentMemory.append({
-              type: type === 'decision' ? 'fact' : type === 'context' ? 'fact' : type,
-              content: content.substring(0, 200),
-              source,
-              importance: type === 'decision' ? 7 : 5,
-            });
-          }
-        }
-      }
-    } catch (err: unknown) {
-      this.#recordMemoryWriteFailure(err, 'persistentMemory.append');
-    }
-  }
-
   // 工具结果缓存代理与 recordObservation 已删除（W1-04，审阅包 L6-P26 / C64，决定①）：SessionStore
   // 只读工具缓存在生产中从无写入者，重复调用去重由 Agent 工具管道的 duplicateCache 承担。
 
@@ -541,14 +466,16 @@ export class MemoryCoordinator {
   /**
    * 创建维度作用域 (D2/D3: 多 scope 支持)
    *
+   * scope 只在这里创建或整体替换；维度完成/会话完成/释放入口（completeDimension、completeSession、
+   * dispose）已随 W2a-10 删除——宿主从不调用它们，scope 随会话级 coordinator 一同被回收。
+   *
    * @param scopeId 如 'api-patterns:analyst', 'api-patterns:producer'
-   * @param [config.lightweight=false] 轻量模式 (User Chat)
-   * @returns WorkingMemory (Phase 2) / ActiveContext (Phase 3)
+   * @param [config.maxRecentRounds=3] 透传给 ActiveContext 的观察保留轮数
+   * @returns ActiveContext
    */
   createDimensionScope(scopeId: string, config: DimensionScopeConfig = {}): ActiveContext {
     // 先由 ActiveContext 校验配置，再替换 scope；拒绝非法配置不能丢掉现有工作记忆。
     const ac = new ActiveContext({
-      lightweight: config.lightweight || false,
       maxRecentRounds: config.maxRecentRounds,
     });
     this.#promptBudgets.delete(scopeId);
@@ -556,59 +483,6 @@ export class MemoryCoordinator {
     this.#activeContexts.set(scopeId, ac);
     this.#log('debug', `[MemoryCoordinator] scope created: ${scopeId} (ActiveContext)`);
     return ac;
-  }
-
-  /**
-   * 完成维度: 蒸馏 + 存储到 SessionStore
-   * @param [report] 附加报告数据
-   * @deprecated 无生产调用方：宿主每个维度只调用 createDimensionScope，维度报告由宿主直接写入
-   *   SessionStore，scope 从不在此释放。删除还是改由宿主接线释放 scope，随待决事项②决定；
-   *   删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  completeDimension(scopeId: string, report?: DimensionReportInput) {
-    this.#promptBudgets.delete(scopeId);
-    try {
-      const ac = this.#activeContexts.get(scopeId);
-      const distilled = ac ? ac.distill() : null;
-
-      if (distilled && this.#sessionStore && report) {
-        this.#sessionStore.storeDimensionReport(scopeId.replace(/:.*$/, ''), {
-          ...report,
-          workingMemoryDistilled: distilled,
-        });
-      }
-
-      // 清理 ActiveContext
-      if (ac) {
-        ac.clear();
-        this.#activeContexts.delete(scopeId);
-      }
-
-      // 切换当前 scope 到下一个或清空
-      if (this.#currentScopeId === scopeId) {
-        this.#currentScopeId = null;
-      }
-      this.#log('debug', `[MemoryCoordinator] scope completed: ${scopeId}`);
-    } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] completeDimension error: ${errorMessage(err)}`);
-    }
-  }
-
-  /**
-   * 完成会话：只清空当前 scope 指针，不删除已建 scope，也不触发 Consolidator 固化
-   * （固化由宿主另行调用 EpisodicConsolidator）。
-   * @returns 恒为 { consolidated: 0 }；内部异常时返回 null 并记 warn
-   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  async completeSession(): Promise<{ consolidated: number } | null> {
-    try {
-      this.#currentScopeId = null;
-      this.#log('info', '[MemoryCoordinator] session completed');
-      return { consolidated: 0 };
-    } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] completeSession error: ${errorMessage(err)}`);
-      return null;
-    }
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -697,14 +571,6 @@ export class MemoryCoordinator {
   }
 
   /**
-   * 获取 PersistentMemory
-   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getPersistentMemory() {
-    return this.#persistentMemory || null;
-  }
-
-  /**
    * 获取 ConversationLog / ConversationStore
    * @deprecated conversationLog 端口从未被注入，恒返回 null；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
    */
@@ -742,68 +608,9 @@ export class MemoryCoordinator {
     }
   }
 
-  // ═══════════════════════════════════════════════════════════
-  // 断点续传
-  // ═══════════════════════════════════════════════════════════
-
-  /**
-   * 保存 checkpoint（委托 SessionStore.saveCheckpoint，不传 WriteZone）
-   * @deprecated 无生产调用方（宿主断点续跑用自己的维度 checkpoint）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  async checkpoint(projectRoot: string) {
-    try {
-      if (this.#sessionStore?.saveCheckpoint) {
-        await this.#sessionStore.saveCheckpoint(projectRoot);
-      }
-    } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] checkpoint error: ${errorMessage(err)}`);
-    }
-  }
-
-  /**
-   * 恢复 checkpoint（委托 SessionStore.loadCheckpoint）
-   * @deprecated 无生产调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  async restore(projectRoot: string): Promise<boolean> {
-    try {
-      if (this.#sessionStore?.loadCheckpoint) {
-        return await this.#sessionStore.loadCheckpoint(projectRoot);
-      }
-      return false;
-    } catch (err: unknown) {
-      this.#log('warn', `[MemoryCoordinator] restore error: ${errorMessage(err)}`);
-      return false;
-    }
-  }
-
-  // ═══════════════════════════════════════════════════════════
-  // 清理
-  // ═══════════════════════════════════════════════════════════
-
-  /**
-   * 释放全部 scope 与 SessionStore 引用。
-   * @deprecated 无生产调用方：宿主从不调用 dispose，会话级 coordinator 随运行结束被回收。
-   *   删除还是改由宿主在会话结束时接线调用，随待决事项②决定；删除前须附 src、测试、宿主生产与
-   *   宿主测试的零引用扫描。
-   */
-  dispose() {
-    this.#promptBudgets.clear();
-    this._lastSurplus = 0;
-    for (const [scopeId, ac] of this.#activeContexts) {
-      try {
-        ac.clear();
-      } catch (err: unknown) {
-        // 清理失败不阻断释放：下面仍会丢弃整张 scope 表，这里只告警说明哪个 scope 未能先行清空。
-        this.#log(
-          'warn',
-          `[MemoryCoordinator] dispose: clearing scope ${scopeId} failed, scope dropped anyway; ${errorMessage(err)}`
-        );
-      }
-    }
-    this.#activeContexts.clear();
-    this.#sessionStore = null;
-    this.#currentScopeId = null;
-  }
+  // 检查点链（checkpoint / restore → SessionStore.saveCheckpoint / loadCheckpoint）与 dispose 已随
+  // W2a-10 删除：宿主断点续跑经 SessionStore.toJSON()/fromJSON() 恢复会话，会话结束时只 dispose
+  // SessionStore（总控裁定：L6-P28 只 dispose SessionStore，L6-P25 的 MemoryCoordinator.dispose 随之删除）。
 
   // ═══════════════════════════════════════════════════════════
   // 私有方法
@@ -841,24 +648,6 @@ export class MemoryCoordinator {
       );
     }
     return { ac, ambiguousScopes: 0 };
-  }
-
-  #recordMemoryWriteFailure(err: unknown, operation: 'persistentMemory.append'): void {
-    const diagnostic: MemoryWriteFailureDiagnostic = {
-      code:
-        typeof err === 'object' &&
-        err !== null &&
-        (err as { code?: unknown }).code === 'MEMORY_STORE_WRITE_FAILED'
-          ? 'MEMORY_STORE_WRITE_FAILED'
-          : 'MEMORY_COORDINATOR_WRITE_FAILED',
-      message: err instanceof Error ? err.message : String(err),
-      operation,
-    };
-    this.#writeFailures.push(diagnostic);
-    this.#log(
-      'warn',
-      `[MemoryCoordinator] ${operation} failed (${diagnostic.code}): ${diagnostic.message}`
-    );
   }
 
   /** 构建 SessionStore section (legacy: EpisodicMemory) */

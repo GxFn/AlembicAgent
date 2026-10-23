@@ -104,52 +104,48 @@ describe('generateDimensionPipeline produce stage and the shared MemoryCoordinat
     const buildB = vi.spyOn(scopeB, 'buildContext').mockReturnValue('');
     const lastBudget = (spy: typeof buildA) => spy.mock.calls.at(-1)?.[0];
 
-    try {
-      // A 仍在 analyze：先记录静态快照。没有持久/会话记忆时静态部分为空，静态份额全部成为 surplus。
-      await coordinator.buildStaticMemoryPrompt({ scopeId: SCOPE_A, mode: 'analyst' });
-      coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_A, mode: 'analyst' });
-      const budgetABefore = lastBudget(buildA);
-      // analyst 分配下 activeContext=450，surplus=550；两者之和才是 A 应得的配额。
-      expect(budgetABefore).toBe(TOTAL_MEMORY_BUDGET);
+    // A 仍在 analyze：先记录静态快照。没有持久/会话记忆时静态部分为空，静态份额全部成为 surplus。
+    await coordinator.buildStaticMemoryPrompt({ scopeId: SCOPE_A, mode: 'analyst' });
+    coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_A, mode: 'analyst' });
+    const budgetABefore = lastBudget(buildA);
+    // analyst 分配下 activeContext=450，surplus=550；两者之和才是 A 应得的配额。
+    expect(budgetABefore).toBe(TOTAL_MEMORY_BUDGET);
 
-      // B 已进入 produce：同样持有自己的 producer 快照(activeContext=250，surplus=750)。
-      await coordinator.buildStaticMemoryPrompt({ scopeId: SCOPE_B, mode: 'producer' });
-      coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_B, mode: 'producer' });
-      const budgetBBefore = lastBudget(buildB);
-      expect(budgetBBefore).toBe(TOTAL_MEMORY_BUDGET);
+    // B 已进入 produce：同样持有自己的 producer 快照(activeContext=250，surplus=750)。
+    await coordinator.buildStaticMemoryPrompt({ scopeId: SCOPE_B, mode: 'producer' });
+    coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_B, mode: 'producer' });
+    const budgetBBefore = lastBudget(buildB);
+    expect(budgetBBefore).toBe(TOTAL_MEMORY_BUDGET);
 
-      const allocateBudget = vi.spyOn(coordinator, 'allocateBudget');
-      const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
-        params: { needsCandidates: true },
-        context: { memoryCoordinator: coordinator },
-      }) as Array<{ name: string; promptBuilder?: (ctx: Record<string, unknown>) => unknown }>;
-      const produce = stages.find((stage) => stage.name === 'produce');
-      expect(typeof produce?.promptBuilder).toBe('function');
+    const allocateBudget = vi.spyOn(coordinator, 'allocateBudget');
+    const stages = new AgentStageFactoryRegistry().build('generateDimensionPipeline', {
+      params: { needsCandidates: true },
+      context: { memoryCoordinator: coordinator },
+    }) as Array<{ name: string; promptBuilder?: (ctx: Record<string, unknown>) => unknown }>;
+    const produce = stages.find((stage) => stage.name === 'produce');
+    expect(typeof produce?.promptBuilder).toBe('function');
 
-      // B 以完整的 quality_gate 交接构建 produce 提示：提示必须真实生成，而不是在前置校验处抛错。
-      const prompt = produce?.promptBuilder?.({
-        gateArtifact: {
-          analysisText: 'L8-C14 producer handoff marker',
-          findings: [],
-          referencedFiles: ['src/a.ts'],
-          negativeSignals: [],
-        },
-        dimConfig: { id: 'dimB', label: 'Dimension B' },
-        projectInfo: { name: 'fixture' },
-      });
-      expect(typeof prompt).toBe('string');
-      expect(prompt).toContain('L8-C14 producer handoff marker');
+    // B 以完整的 quality_gate 交接构建 produce 提示：提示必须真实生成，而不是在前置校验处抛错。
+    const prompt = produce?.promptBuilder?.({
+      gateArtifact: {
+        analysisText: 'L8-C14 producer handoff marker',
+        findings: [],
+        referencedFiles: ['src/a.ts'],
+        negativeSignals: [],
+      },
+      dimConfig: { id: 'dimB', label: 'Dimension B' },
+      projectInfo: { name: 'fixture' },
+    });
+    expect(typeof prompt).toBe('string');
+    expect(prompt).toContain('L8-C14 producer handoff marker');
 
-      // A 的快照与 surplus 未被清空：配额仍是 activeContext + surplus，而不是退回 analyst 的 450。
-      coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_A, mode: 'analyst' });
-      expect(lastBudget(buildA)).toBe(budgetABefore);
-      // B 自己的 producer 快照同样保持不变(退回时只剩 activeContext=250)。
-      coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_B, mode: 'producer' });
-      expect(lastBudget(buildB)).toBe(budgetBBefore);
-      // 行为断言之外再钉住根因：produce 装配路径不再触碰共享 coordinator 的全局分配。
-      expect(allocateBudget).not.toHaveBeenCalled();
-    } finally {
-      coordinator.dispose();
-    }
+    // A 的快照与 surplus 未被清空：配额仍是 activeContext + surplus，而不是退回 analyst 的 450。
+    coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_A, mode: 'analyst' });
+    expect(lastBudget(buildA)).toBe(budgetABefore);
+    // B 自己的 producer 快照同样保持不变(退回时只剩 activeContext=250)。
+    coordinator.buildDynamicMemoryPrompt({ scopeId: SCOPE_B, mode: 'producer' });
+    expect(lastBudget(buildB)).toBe(budgetBBefore);
+    // 行为断言之外再钉住根因：produce 装配路径不再触碰共享 coordinator 的全局分配。
+    expect(allocateBudget).not.toHaveBeenCalled();
   });
 });

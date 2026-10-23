@@ -209,8 +209,9 @@ export interface ExplorationTrace {
     tool: string;
     params?: Record<string, unknown>;
     /**
-     * 工具回执是否成功。PlanTracker 只跳过 ok===false 的动作；缺席（旧 addAction 无回执）按成功处理，
-     * 因此按本端口实现 trace 时必须如实填写失败，否则失败的读取会完成计划步骤。
+     * 工具回执是否成功。PlanTracker 只跳过 ok===false 的动作；缺席按成功处理。ActiveContext 经
+     * recordToolCall 总会写入真实回执（无回执的旧 addAction 已随 W2a-10 删除），但端口的其它实现
+     * 可能不填，因此按本端口实现 trace 时必须如实填写失败，否则失败的读取会完成计划步骤。
      */
     ok?: boolean;
     /** code.read 真正读到的文件（批量读取中失败成员不在其中）；存在时优先于请求参数里的路径。 */

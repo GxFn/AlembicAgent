@@ -10,12 +10,17 @@
  *   WorkingMemory.js  → Scratchpad + 工具压缩策略 + buildContext + distill
  *   ReasoningTrace.js → rounds + plan + thoughts + extractAndSetPlan + observations
  *
- * 兼容性:
- *   - 提供所有 ReasoningTrace 和 WorkingMemory 的公共方法
+ * 入口收敛（W2a-10，审阅包 L6-P25 / L6-P16）:
+ *   - 旧 RT/WM 入口（addAction / addObservation / observe）已删除，工具调用统一经 recordToolCall 记录；
+ *   - 计划只经 expectPlan 授权 + extractAndSetPlan 写入（setPlan / updatePlan 已删除），计划历史
+ *     只经 toJSON().planHistory 暴露条数；无生产读取方的 getPlanHistory / getCurrentIteration /
+ *     getThoughts / getHighPriorityFindings 与静态 fromJSON 一并删除；构造选项只剩 maxRecentRounds
  *   - ExplorationTracker 可直接使用 ActiveContext 作为 trace 参数 (L5 缓解)
  *   - MemoryCoordinator 通过 createDimensionScope 创建实例
  *
- * 生命周期: 单次 execute() 调用 (由 MemoryCoordinator 管理创建/蒸馏/销毁)
+ * 生命周期: 单次 execute() 调用。由 MemoryCoordinator.createDimensionScope 创建；distill() 由
+ *   buildAnalysisArtifact 与 ContextWindow 的 L4 记忆包读取；scope 随会话级 coordinator 一同被回收
+ *   （coordinator 的 completeDimension / dispose 已随 W2a-10 删除）。
  *
  * @module ActiveContext
  */
@@ -673,12 +678,6 @@ function readSearchMatchCount(payload: unknown): number | null {
 
 interface ActiveContextOptions {
   maxRecentRounds?: number;
-  /**
-   * 轻量模式：不维护观察滑动窗口，buildContext() 返回空串；Scratchpad 照常工作。
-   * @deprecated 唯一生产入口 MemoryCoordinator.createDimensionScope 的调用方（src 与宿主）都不传，
-   *   生产恒为 false；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  lightweight?: boolean;
 }
 
 interface ScratchpadEntry {
@@ -691,7 +690,10 @@ interface ScratchpadEntry {
 }
 
 interface RoundAction {
-  /** 旧 addAction 无回执，保持 undefined；真实工具回执明确记录成功/失败。 */
+  /**
+   * 工具回执是否成功。recordToolCall 总会写入真实回执；保持可选是为了与 ExplorationTrace 端口
+   * 的形状一致（端口的其它实现可能不填，PlanTracker 按成功处理缺席）。
+   */
   ok?: boolean;
   successfulReadPaths?: string[];
   tool: string;
@@ -831,13 +833,6 @@ interface CompressedObservation {
   ledgerItems: ObservationLedgerItem[];
 }
 
-interface ActiveContextJSON {
-  rounds?: Round[];
-  scratchpad?: ScratchpadEntry[];
-  totalObservations?: number;
-  plan?: Plan;
-}
-
 const OBSERVATION_LEDGER_CATEGORIES: ObservationLedgerCategory[] = [
   'evidence',
   'readSet',
@@ -886,13 +881,6 @@ export class ActiveContext {
   // ── 配置 ──
   /** 保留最近 N 轮原始观察 */
   #maxRecentRounds: number;
-  /**
-   * 轻量模式：跳过 WM 滑动窗口（不累计 totalObservations、不保留也不压缩观察，observe() 直接返回）
-   * 并让 buildContext() 返回空串。Scratchpad 不受影响：noteKeyFinding 照常写入，distill().keyFindings
-   * 照常带出。能传入该选项的生产入口只有 MemoryCoordinator.createDimensionScope（config.lightweight），
-   * 而当前 src 与宿主的调用都不传它，所以生产中恒为 false。
-   */
-  #lightweight: boolean;
   /** 总观察计数 */
   #totalObservations = 0;
 
@@ -900,8 +888,6 @@ export class ActiveContext {
 
   /**
    * @param [options.maxRecentRounds=3] 保留最近 N 轮原始结果 (WM 滑动窗口)
-   * @param [options.lightweight=false] 轻量模式 (D5): 跳过 WM 滑动窗口与 buildContext 输出；
-   *   Scratchpad（noteKeyFinding / distill().keyFindings）仍照常工作
    */
   constructor(options: ActiveContextOptions = {}) {
     const maxRecentRounds = options.maxRecentRounds ?? 3;
@@ -910,7 +896,6 @@ export class ActiveContext {
       throw new RangeError('ActiveContext maxRecentRounds must be a non-negative integer');
     }
     this.#maxRecentRounds = maxRecentRounds;
-    this.#lightweight = options.lightweight ?? false;
     this.#logger = Logger.getInstance();
   }
 
@@ -949,7 +934,7 @@ export class ActiveContext {
   }
 
   // ═══════════════════════════════════════════════════════
-  // §2.2: 记录 (合并 WM.observe + RT.addAction/addObservation)
+  // §2.2: 记录 (合并原 WM.observe + RT.addAction/addObservation；旧入口已随 W2a-10 删除)
   // ═══════════════════════════════════════════════════════
 
   /** 记录 AI 的推理文本（从 aiResult.text 提取） */
@@ -987,54 +972,16 @@ export class ActiveContext {
     const observationMeta = this.#buildObservationMetaSafely(toolName, args, result, isNew, round);
     this.#currentRound?.observations.push({ tool: toolName, ...observationMeta });
 
-    // ── WM 部分: 滑动窗口压缩 (非轻量模式) ──
-    if (!this.#lightweight) {
-      this.#totalObservations++;
-      this.#recentObservations.push({
-        toolName,
-        args,
-        result,
-        round,
-        timestamp: Date.now(),
-      });
-
-      while (this.#recentObservations.length > this.#maxRecentRounds) {
-        const oldest = this.#recentObservations.shift();
-        if (oldest) {
-          const summary = this.#compressObservation(oldest);
-          this.#compressedObservations.push(summary);
-        }
-      }
-    }
-  }
-
-  /**
-   * 兼容旧 RT API: 记录一次工具调用 (Action only)
-   * @deprecated 旧 ReasoningTrace 入口，生产统一走 recordToolCall；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  addAction(toolName: string, params: Record<string, unknown>) {
-    this.#currentRound?.actions.push({ tool: toolName, params });
-  }
-
-  /**
-   * 兼容旧 RT API: 记录一次工具结果的结构化观察
-   * @deprecated 旧 ReasoningTrace 入口，生产统一走 recordToolCall；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  addObservation(toolName: string, meta: Record<string, unknown>) {
-    this.#currentRound?.observations.push({ tool: toolName, ...meta });
-  }
-
-  /**
-   * 兼容旧 WM API: 记录工具调用结果 (Observe, 仅 WM 滑动窗口)
-   * @deprecated 旧 WorkingMemory 入口，生产统一走 recordToolCall（其滑动窗口逻辑与本方法重复）；
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  observe(toolName: string, result: unknown, round: number) {
-    if (this.#lightweight) {
-      return;
-    }
+    // ── WM 部分: 滑动窗口压缩 ──
     this.#totalObservations++;
-    this.#recentObservations.push({ toolName, result, round, timestamp: Date.now() });
+    this.#recentObservations.push({
+      toolName,
+      args,
+      result,
+      round,
+      timestamp: Date.now(),
+    });
+
     while (this.#recentObservations.length > this.#maxRecentRounds) {
       const oldest = this.#recentObservations.shift();
       if (oldest) {
@@ -1111,7 +1058,7 @@ export class ActiveContext {
   // ═══════════════════════════════════════════════════════
 
   /**
-   * 从 AI 响应文本中提取计划，自动调用 setPlan/updatePlan
+   * 从 AI 响应文本中提取计划并写入（首次建立计划，或在授权下覆盖已有计划并把旧计划推入历史）
    *
    * 防御措施: 已存在计划时，仅在 expectPlan 授权下才覆盖。
    * 这防止 reflection 回复中的编号列表（非计划的回应文本）污染已有计划。
@@ -1161,7 +1108,7 @@ export class ActiveContext {
 
     if (this.#plan) {
       const previousStepCount = this.#plan.steps.length;
-      this.#updatePlan(extraction.planText, iteration);
+      this.#updatePlan(this.#plan, extraction.planText, iteration);
       this.#debugPlan(
         `plan overridden under authorization at iteration ${iteration} ` +
           `(granted at iteration ${authorization?.iteration ?? 'n/a'}): ` +
@@ -1198,23 +1145,6 @@ export class ActiveContext {
     );
   }
 
-  /**
-   * 直接设置计划（绕过 extractAndSetPlan 的授权与解析）
-   * @deprecated 生产中没有调用方（计划经 PlanTracker 的 expectPlan 授权、AgentRuntime 的 extractAndSetPlan 写入，仅测试直接调用）；
-   *   随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  setPlan(planText: string, iteration: number) {
-    this.#setPlan(planText, iteration);
-  }
-
-  /**
-   * 更新计划 (保留旧 plan 到 history)
-   * @deprecated 生产中没有调用方（重规划走 extractAndSetPlan）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  updatePlan(replanText: string, iteration: number) {
-    this.#updatePlan(replanText, iteration);
-  }
-
   /** 获取当前计划 (只读副本) */
   getPlan() {
     if (!this.#plan) {
@@ -1232,27 +1162,11 @@ export class ActiveContext {
   }
 
   /**
-   * 获取计划历史 (F7)
-   * @deprecated 生产中没有调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getPlanHistory() {
-    return structuredClone(this.#planHistory);
-  }
-
-  /**
    * 获取当前轮次的 actions (ExplorationTracker.updatePlanProgress 使用, L5 修复)
    * @returns >}
    */
   getCurrentRoundActions() {
     return structuredClone(this.#currentRound?.actions || []);
-  }
-
-  /**
-   * 获取当前轮次的 iteration 编号 (F8)
-   * @deprecated 生产中没有调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getCurrentIteration() {
-    return this.#currentRound?.iteration || null;
   }
 
   // ═══════════════════════════════════════════════════════
@@ -1267,10 +1181,6 @@ export class ActiveContext {
    * @returns Markdown 格式的上下文块，空字符串表示无内容
    */
   buildContext(tokenBudget = Infinity) {
-    if (this.#lightweight) {
-      return '';
-    }
-
     const parts: string[] = [];
     let remaining = tokenBudget;
 
@@ -1363,17 +1273,6 @@ export class ActiveContext {
   // ═══════════════════════════════════════════════════════
 
   /**
-   * 获取所有有 Thought 的轮次
-   * @returns `{ iteration, thought }[]`，按轮次顺序
-   * @deprecated 生产中没有调用方；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getThoughts() {
-    return this.#rounds
-      .filter((r) => r.thought)
-      .map((r) => ({ iteration: r.iteration, thought: r.thought }));
-  }
-
-  /**
    * 获取最近 N 轮的紧凑摘要 (ExplorationTracker.#checkReflection 使用)
    * @param [n=3] 回看轮数
    */
@@ -1437,18 +1336,6 @@ export class ActiveContext {
     return this.#totalObservations;
   }
 
-  /**
-   * 获取 scratchpad 中的高重要性发现
-   * @returns importance ≥ minImportance 的发现深拷贝，按 importance 降序
-   * @deprecated 生产中没有调用方（分析产物 buildAnalysisArtifact 经 distill().keyFindings 读取发现）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  getHighPriorityFindings(minImportance = 7) {
-    return this.#scratchpad
-      .filter((f) => f.importance >= minImportance)
-      .sort((a, b) => b.importance - a.importance)
-      .map((finding) => structuredClone(finding));
-  }
-
   // ═══════════════════════════════════════════════════════
   // §2.9: 序列化 (从 ReasoningTrace 继承)
   // ═══════════════════════════════════════════════════════
@@ -1475,37 +1362,8 @@ export class ActiveContext {
     };
   }
 
-  /**
-   * 从 toJSON() 的输出重建 ActiveContext（有损）
-   *
-   * 只恢复 rounds / scratchpad / totalObservations / plan；构造选项
-   * （maxRecentRounds、lightweight）、观察滑动窗口、压缩观察与计划历史都不恢复，输入也不做结构校验。
-   * 旧快照里的严格分析上下文投影不再读取（审阅包 L6-P27：严格链由宿主编排、由阶段配置表达，
-   * ActiveContext 不再承载它），与其它未知字段一样被忽略，不会再因投影 hash 校验失败而抛错。
-   * @param json toJSON() 的输出
-   * @deprecated 生产中没有断点续传调用方（仅测试使用）；随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  static fromJSON(json: ActiveContextJSON) {
-    const ctx = new ActiveContext();
-    if (json.rounds) {
-      ctx.#rounds = structuredClone(json.rounds);
-    }
-    if (json.scratchpad) {
-      ctx.#scratchpad = structuredClone(json.scratchpad);
-    }
-    if (json.totalObservations) {
-      ctx.#totalObservations = json.totalObservations;
-    }
-    if (json.plan) {
-      ctx.#plan = {
-        text: json.plan.text,
-        steps: structuredClone(json.plan.steps),
-        createdAtIteration: json.plan.createdAtIteration,
-        lastUpdatedAtIteration: json.plan.lastUpdatedAtIteration,
-      };
-    }
-    return ctx;
-  }
+  // 静态 fromJSON（有损重建）已随 W2a-10 删除：生产中没有断点续传调用方，宿主续跑经
+  // SessionStore.toJSON()/fromJSON() 恢复会话快照，ActiveContext 每个维度重新创建。
 
   /** 清空 ActiveContext — 释放内存 */
   clear() {
@@ -1677,7 +1535,7 @@ export class ActiveContext {
   }
 
   /**
-   * 摘要三层降级，任何一层都不能让 recordToolCall/observe/distill 抛错：
+   * 摘要三层降级，任何一层都不能让 recordToolCall/distill 抛错：
    *   1. 工具特化策略（只认识已知业务形状）；
    *   2. defaultCompress 通用 JSON 截断（无策略的工具从这里开始）；
    *   3. lastResortCompress：JSON 也失败（BigInt、循环引用、抛错 getter）时只读自有键名生成占位文本。
@@ -2037,15 +1895,16 @@ export class ActiveContext {
     };
   }
 
-  #updatePlan(replanText: string, iteration: number) {
-    if (!this.#plan) {
-      this.#setPlan(replanText, iteration);
-      return;
-    }
-    this.#planHistory.push({ ...this.#plan, steps: structuredClone(this.#plan.steps) });
-    this.#plan.text = replanText;
-    this.#plan.steps = this.#parsePlanSteps(replanText);
-    this.#plan.lastUpdatedAtIteration = iteration;
+  /**
+   * 授权覆盖已有计划：旧计划推入历史（toJSON().planHistory 计数），保留 createdAtIteration。
+   * 唯一调用方是 extractAndSetPlan 的“已有计划”分支，公开的 updatePlan 已随 W2a-10 删除，
+   * 因此这里不再需要“无计划时退回 setPlan”的分支。
+   */
+  #updatePlan(plan: Plan, replanText: string, iteration: number) {
+    this.#planHistory.push({ ...plan, steps: structuredClone(plan.steps) });
+    plan.text = replanText;
+    plan.steps = this.#parsePlanSteps(replanText);
+    plan.lastUpdatedAtIteration = iteration;
   }
 
   /** 从 AI 文本中解析计划步骤 */

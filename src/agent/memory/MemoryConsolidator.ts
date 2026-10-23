@@ -6,14 +6,13 @@
  *   - Extract-Update Consolidation (ADD / UPDATE / MERGE / NOOP)
  *   - Mem0 风格冲突解决 (矛盾检测 + 自动替换；同批不同维度的“矛盾”各自保留)
  *   - 写入路径上的来源元数据合并 (tags / relatedEntities / sourceDimension / sourceEvidence)
- *   - Legacy JSONL 迁移
+ *
+ * 旧版 Memory.js JSONL 迁移（migrateFromLegacy 及其旧类型映射）已随 W2a-10（审阅包 L6-P25）删除：
+ * 唯一调用方 PersistentMemory.migrateFromLegacy 也从未被调用。
  *
  * @module MemoryConsolidator
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
-import type { WriteZone } from '@alembic/core/io';
 import { observeSafely } from '#shared/observers.js';
 import type { DeserializedMemory, MemoryRow, MemoryUpdates } from './MemoryStore.js';
 import { MEMORY_STORE_MAX_MEMORIES, MemoryStore } from './MemoryStore.js';
@@ -389,82 +388,6 @@ export class MemoryConsolidator {
     );
 
     return stats;
-  }
-
-  // ═══════════════════════════════════════════════════════════
-  // Legacy Migration
-  // ═══════════════════════════════════════════════════════════
-
-  /**
-   * 从旧版 Memory.js JSONL 文件迁移数据到 SQLite
-   *
-   * @returns 迁移结果 { migrated, skipped, error? }：migrated = 新增 + 合并条数；
-   *   迁移整体失败时 migrated/skipped 为 0 并带 error
-   * @deprecated 唯一调用方 PersistentMemory.migrateFromLegacy 也无人调用（wz 参数从未传入）；
-   *   若事项②决定保留，需先补坏行/改名失败的诊断与输入校验。随待决事项②“公开面收窄”删除，删除前须附 src、测试、宿主生产与宿主测试的零引用扫描。
-   */
-  async migrateFromLegacy(
-    projectRoot: string,
-    wz?: WriteZone
-  ): Promise<{ migrated: number; skipped: number; error?: string }> {
-    const legacyPath = path.join(projectRoot, '.asd', 'memory.jsonl');
-
-    if (!fs.existsSync(legacyPath)) {
-      return { migrated: 0, skipped: 0 };
-    }
-
-    try {
-      const raw = fs.readFileSync(legacyPath, 'utf-8').trim();
-      if (!raw) {
-        return { migrated: 0, skipped: 0 };
-      }
-
-      const lines = raw.split('\n').filter(Boolean);
-      const candidates = lines
-        .map((line) => {
-          try {
-            return JSON.parse(line);
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean)
-        .map((m) => ({
-          type: MemoryConsolidator.#mapLegacyType(m.type),
-          content: (m.content || '').trim(),
-          source: m.source || 'user',
-          importance: m.type === 'decision' ? 7 : 5,
-        }))
-        .filter((m) => m.content.length >= 5);
-
-      if (candidates.length === 0) {
-        return { migrated: 0, skipped: lines.length };
-      }
-
-      const result = this.consolidate(candidates, {
-        bootstrapSession: 'legacy-migration',
-      });
-
-      try {
-        if (wz) {
-          wz.rename(wz.data('.asd/memory.jsonl'), wz.data('.asd/memory.jsonl.migrated'));
-        } else {
-          fs.renameSync(legacyPath, `${legacyPath}.migrated`);
-        }
-      } catch {
-        /* rename failure non-critical */
-      }
-
-      const migrated = result.added + result.merged;
-      this.#log(
-        `Legacy migration: ${migrated} migrated (${result.added} added, ${result.merged} merged), ${result.skipped} skipped from ${legacyPath}`
-      );
-
-      return { migrated, skipped: result.skipped };
-    } catch (err: unknown) {
-      this.#log(`Legacy migration failed: ${(err as Error).message}`);
-      return { migrated: 0, skipped: 0, error: (err as Error).message };
-    }
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -918,16 +841,6 @@ export class MemoryConsolidator {
     ]);
 
     return new Set(tokens.filter((t) => !stopWords.has(t)));
-  }
-
-  /** Legacy type 映射 */
-  static #mapLegacyType(legacyType: string): string {
-    switch (legacyType) {
-      case 'preference':
-        return 'preference';
-      default:
-        return 'fact';
-    }
   }
 
   #logDebug(msg: string) {

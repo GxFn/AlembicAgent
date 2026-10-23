@@ -2,9 +2,10 @@
  * SessionStore 序列化校验与写入口归一化
  *
  * 两类入口共用同一套形状规则，保证“写得进去的状态一定读得回来”：
- *   - 快照入口（`SessionStore.fromJSON()` / `loadCheckpoint()` / `storeDimensionReport()`）走
- *     `validateSessionStoreShape`：字段缺失补默认值（兼容旧快照），字段存在但类型错误一律抛 Error，
- *     不再静默改写成默认值。
+ *   - 快照入口（`SessionStore.fromJSON()` / `storeDimensionReport()`）走 `validateSessionStoreShape`：
+ *     字段缺失补默认值（兼容旧快照），字段存在但类型错误、或报告 dimId 与所在键不一致时一律抛 Error，
+ *     不再静默改写成默认值。宿主断点续跑保存的是 `toJSON()` 快照，经 `fromJSON()` 走同一套规则；
+ *     原先的检查点文件入口 `loadCheckpoint()` 已随 W2a-10（审阅包 L6-P25）删除。
  *   - 单项写入口（`addDimensionDigest()` / `addTierReflection()`）的数据来自 AI 回复或宿主未校验的
  *     dimension checkpoint，走 `normalizeDimensionDigest` / `normalizeTierReflection`：可修复的偏离
  *     归一化（丢弃或置默认）并逐项返回降级记录交给调用方告警；无法归一化（整体不是对象）时抛 Error。

@@ -70,6 +70,17 @@ function stageOutput(reply = 'done') {
   };
 }
 
+/**
+ * ActiveContext.getCurrentIteration 已随 W2a-10 删除（审阅包 L6-P25）：改为观测 toJSON().rounds。
+ * 未关闭的轮次不会出现在 rounds 里；补一次 endRound() 后轮数仍不变，说明运行已关闭了全部轮次，
+ * 没有留下打开的轮次（若有，endRound 会把它推入 rounds 让轮数加一）。
+ */
+function expectNoOpenRound(trace: ActiveContext, closedRounds: number) {
+  expect(trace.toJSON().rounds).toHaveLength(closedRounds);
+  trace.endRound();
+  expect(trace.toJSON().rounds).toHaveLength(closedRounds);
+}
+
 async function flushPipelineTasks() {
   for (let index = 0; index < 30; index++) {
     await Promise.resolve();
@@ -105,18 +116,14 @@ describe('Runtime operation boundary', () => {
         throw new Error('Cleanup diagnostic failed');
       },
     };
-    try {
-      await expect(
-        runtime.reactLoop('close round', { trace, memoryCoordinator: memory })
-      ).rejects.toBe(mode === 'normal' ? closeFailure : primaryFailure);
-      expect(close).toHaveBeenCalledOnce();
-      expect(chat).toHaveBeenCalledOnce();
-      expect(execute).toHaveBeenCalledTimes(mode === 'normal' ? 0 : 1);
-      expect(runtime.toolCallHistory).toHaveLength(mode === 'normal' ? 0 : 1);
-      expect(finalized).not.toHaveBeenCalled();
-    } finally {
-      memory.dispose();
-    }
+    await expect(
+      runtime.reactLoop('close round', { trace, memoryCoordinator: memory })
+    ).rejects.toBe(mode === 'normal' ? closeFailure : primaryFailure);
+    expect(close).toHaveBeenCalledOnce();
+    expect(chat).toHaveBeenCalledOnce();
+    expect(execute).toHaveBeenCalledTimes(mode === 'normal' ? 0 : 1);
+    expect(runtime.toolCallHistory).toHaveLength(mode === 'normal' ? 0 : 1);
+    expect(finalized).not.toHaveBeenCalled();
   });
 
   it('closes a pre-exit trace round before finalization observers run', async () => {
@@ -126,28 +133,29 @@ describe('Runtime operation boundary', () => {
     const { runtime } = harness(chat);
     const controller = new AbortController();
     controller.abort();
-    let observed: number | null | undefined;
+    let observedRounds: number | undefined;
     runtime.hookSystem.on('agent:finalize', () => {
-      observed = trace.getCurrentIteration();
+      // 终结观察者运行时轮次必须已关闭：关闭的轮次才进入 toJSON().rounds。
+      observedRounds = trace.toJSON().rounds.length;
     });
     await runtime.reactLoop('stop', { source: 'system', trace, abortSignal: controller.signal });
     expect(chat).not.toHaveBeenCalled();
-    expect(observed).toBeNull();
-    expect(trace.getCurrentIteration()).toBeNull();
-    expect(trace.toJSON().rounds).toHaveLength(1);
+    expect(observedRounds).toBe(1);
+    expectNoOpenRound(trace, 1);
   });
 
   it('closes every empty-response retry round before forced summary', async () => {
     vi.useFakeTimers();
     const trace = new ActiveContext();
-    let observed: number | null | undefined;
+    let observedRounds: number | undefined;
     const chat = vi
       .fn()
       .mockResolvedValueOnce({ text: '', functionCalls: [] })
       .mockResolvedValueOnce({ text: '', functionCalls: [] })
       .mockResolvedValueOnce({ text: '', functionCalls: [] })
       .mockImplementationOnce(async () => {
-        observed = trace.getCurrentIteration();
+        // 强制摘要调用发生时三轮空响应重试都已关闭，且摘要本身不再打开新轮次。
+        observedRounds = trace.toJSON().rounds.length;
         return { text: 'summary retained', functionCalls: [] };
       });
     const { runtime } = harness(chat, 8);
@@ -159,9 +167,8 @@ describe('Runtime operation boundary', () => {
     await vi.runAllTimersAsync();
     expect((await pending).reply).toBe('summary retained');
     expect(chat).toHaveBeenCalledTimes(4);
-    expect(observed).toBeNull();
-    expect(trace.getCurrentIteration()).toBeNull();
-    expect(trace.toJSON().rounds).toHaveLength(3);
+    expect(observedRounds).toBe(3);
+    expectNoOpenRound(trace, 3);
   });
 
   it.each([
@@ -212,7 +219,9 @@ describe('Runtime operation boundary', () => {
     expect(chat).toHaveBeenCalledTimes(mode === 'abort' ? 0 : mode === 'complete' ? 2 : 1);
     expect(execute).toHaveBeenCalledTimes(mode === 'abort' ? 0 : 1);
     expect(result.toolCalls).toHaveLength(mode === 'abort' ? 0 : 1);
-    expect(trace.getCurrentIteration()).toBeNull();
+    // 各模式实际关闭的轮数：abort 在首轮 LLM 调用前停止只有 1 轮；timeout 与 complete 在工具轮之后
+    // 还各开过 1、2 个轮次，退出前都已关闭。
+    expectNoOpenRound(trace, { abort: 1, timeout: 2, complete: 3 }[mode]);
     if (mode === 'complete') {
       expect(result.reply).toBe('[scan complete: 0 recipes collected]');
       expect(result).not.toHaveProperty('timedOut');
@@ -327,13 +336,11 @@ describe('Runtime operation boundary', () => {
       expect(result.toolCalls).toMatchObject([
         { tool: 'meta', result: { observed: true }, envelope: { ok: true } },
       ]);
-      expect(trace.getCurrentIteration()).toBeNull();
-      expect(trace.toJSON().rounds).toHaveLength(1);
+      expectNoOpenRound(trace, 1);
       expect(runtime.toolCallHistory).toHaveLength(1);
       expect(runtime.toolCallHistory[0].envelope).toBe(await execute.mock.results[0].value);
     } finally {
       after.mockRestore();
-      memory.dispose();
       vi.useRealTimers();
     }
   });
@@ -2969,7 +2976,6 @@ describe('service compilation and confirmed runtime receipts', () => {
     const { SystemRunContextFactory } = await import(
       '../src/agent/service/SystemRunContextFactory.js'
     );
-    const { MemoryCoordinator } = await import('../src/agent/memory/MemoryCoordinator.js');
     const factory = new SystemRunContextFactory();
     const first = factory.createSystemContext({
       label: 'same',
@@ -2981,19 +2987,14 @@ describe('service compilation and confirmed runtime receipts', () => {
       budget: { maxIterations: 2 },
       lang: 'ts',
     });
-    try {
-      expect(first.trace).toBe(first.activeContext);
-      expect(first.memoryCoordinator).not.toBe(second.memoryCoordinator);
-      expect(first.contextWindow).not.toBe(second.contextWindow);
-      const left = first.sharedState as { submittedTitles: Set<string> };
-      const right = second.sharedState as { submittedTitles: Set<string> };
-      left.submittedTitles.add('first-only');
-      expect(right.submittedTitles.has('first-only')).toBe(false);
-      expect(first.systemRunContext).toMatchObject({ scopeId: 'scan:same', projectLanguage: 'ts' });
-    } finally {
-      (first.memoryCoordinator as InstanceType<typeof MemoryCoordinator>).dispose();
-      (second.memoryCoordinator as InstanceType<typeof MemoryCoordinator>).dispose();
-    }
+    expect(first.trace).toBe(first.activeContext);
+    expect(first.memoryCoordinator).not.toBe(second.memoryCoordinator);
+    expect(first.contextWindow).not.toBe(second.contextWindow);
+    const left = first.sharedState as { submittedTitles: Set<string> };
+    const right = second.sharedState as { submittedTitles: Set<string> };
+    left.submittedTitles.add('first-only');
+    expect(right.submittedTitles.has('first-only')).toBe(false);
+    expect(first.systemRunContext).toMatchObject({ scopeId: 'scan:same', projectLanguage: 'ts' });
   });
 });
 

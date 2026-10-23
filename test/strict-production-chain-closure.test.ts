@@ -221,26 +221,11 @@ describe('ActiveContext no longer carries a strict analysis context projection',
     expect(context.toJSON()).not.toHaveProperty('strictAnalysisContext');
   });
 
-  it.each([
-    { label: 'an intact projection', strict: legacyStrictContext },
-    // 旧实现在恢复时重算 hash 并抛 STRICT_CONTEXT_HASH_MISMATCH；字段不再被读取后，
-    // 篡改过的旧快照同样只是被忽略的未知字段，不能让 legacy 部分恢复失败。
-    { label: 'a tampered projection', strict: { ...legacyStrictContext, contextHash: 'tampered' } },
-    { label: 'an unsupported schema', strict: { ...legacyStrictContext, schemaVersion: 2 } },
-  ])('ignores $label in persisted JSON and restores the legacy state', ({ strict }) => {
-    const source = new ActiveContext();
-    source.noteKeyFinding('legacy scratchpad finding', 'src/live.ts:1', 8);
-    const persisted = { ...source.toJSON(), strictAnalysisContext: strict };
-
-    let restored: ActiveContext | undefined;
-    expect(() => {
-      restored = ActiveContext.fromJSON(persisted);
-    }).not.toThrow();
-    expect(restored?.distill()).not.toHaveProperty('strictAnalysisContext');
-    expect(restored?.toJSON()).not.toHaveProperty('strictAnalysisContext');
-    expect(restored?.distill().keyFindings).toEqual([
-      { finding: 'legacy scratchpad finding', evidence: 'src/live.ts:1', importance: 8 },
-    ]);
+  it('has no static restore entry left to read a persisted strict projection', () => {
+    // ActiveContext.fromJSON（唯一会读旧快照的入口）已随 W2a-10（审阅包 L6-P25）删除：生产中没有断点
+    // 续传调用方，宿主续跑经 SessionStore.toJSON()/fromJSON() 恢复会话。旧快照里的严格投影因此在
+    // ActiveContext 侧没有任何读取方，也就不存在“篡改或旧版本投影让恢复失败”的路径。
+    expect(Object.hasOwn(ActiveContext, 'fromJSON')).toBe(false);
   });
 });
 

@@ -1,8 +1,10 @@
 /**
  * §11.3 H3: MemoryFlushContract — 层级数据流转规约
  *
- * 定义 ActiveContext.distill() 的显式返回类型 DistilledContext，
- * 确保 distill() 的结果在 ActiveContext.clear() 之前完整提取。
+ * 定义 ActiveContext.distill() 的显式返回类型 DistilledContext。生产读取方是 buildAnalysisArtifact
+ * （分析产物的发现与工具摘要）与 ContextWindow 的 L4 记忆包；原先“维度完成时先蒸馏写入 SessionStore、
+ * 再 clear() 释放”的 MemoryCoordinator.completeDimension 无调用方，已随 W2a-10（审阅包 L6-P25）删除，
+ * 维度报告由宿主直接写入 SessionStore。
  * （W2a-09 / L6-P25 删除了无消费者的 DimensionFlushManifest 清单类型与 extractHighPriorityFindings
  * 投影——后者会丢掉 evidenceRefs，且 src 与宿主都不调用。）
  */

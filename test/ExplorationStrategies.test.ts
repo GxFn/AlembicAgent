@@ -32,6 +32,19 @@ import { handle as handleMemory } from '../src/tools/runtime/handlers/memory.js'
 import { ScanProduce } from '../src/tools/runtime/toolsets/ScanProduce.js';
 import { createTempProject } from './helpers/tempProject.js';
 
+/**
+ * 经生产路径种入计划：PlanTracker 发出的 expectPlan 授权 + AgentRuntime 调用的 extractAndSetPlan。
+ * 取代 W2a-10 删除的 setPlan/updatePlan（已有计划时同样把旧计划推入计划历史）；文本不被接受时
+ * 直接抛错，避免夹具静默落空。删除旧方法前已逐次对照：全部夹具解析出的步骤、状态与轮次都与旧
+ * 种法一致，只有带“我的探索计划：”标记的文本，计划正文不再含标记行。
+ */
+function seedPlan(trace: ActiveContext, text: string, iteration: number): void {
+  trace.expectPlan();
+  if (!trace.extractAndSetPlan(text, iteration)) {
+    throw new Error(`seedPlan rejected plan text: ${JSON.stringify(text)}`);
+  }
+}
+
 describe('analyst exploration strategy boundaries', () => {
   it('counts only persisted candidate submissions as producer progress', () => {
     const tracker = ExplorationTracker.resolve(
@@ -581,7 +594,7 @@ describe('R06 real pipeline exploration observations', () => {
   it('does not complete a plan step when its read failed', async () => {
     const t = tracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. Read src/actual.ts', 1);
+    seedPlan(trace, '1. Read src/actual.ts', 1);
     trace.startRound(2);
     await createToolPipeline().execute(
       { id: 'read', name: 'code', args: { action: 'read', params: { path: 'src/actual.ts' } } },
@@ -593,7 +606,7 @@ describe('R06 real pipeline exploration observations', () => {
   it('does not finish one concrete file plan while reading another', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. Read src/auth.ts', 1);
+    seedPlan(trace, '1. Read src/auth.ts', 1);
     trace.startRound(2);
     trace.recordToolCall(
       'code',
@@ -702,7 +715,7 @@ describe('R06 nudge truth and retained behavior controls', () => {
   it('retains successful generic plan matching', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. Read a representative file', 1);
+    seedPlan(trace, '1. Read a representative file', 1);
     trace.startRound(2);
     trace.recordToolCall(
       'code',
@@ -825,7 +838,7 @@ describe('independent R06 repaired-boundary cases', () => {
   it('does not complete the failed member of a partially successful batch read', async () => {
     const t = crossTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. Read src/missing.ts', 1);
+    seedPlan(trace, '1. Read src/missing.ts', 1);
     trace.startRound(2);
     const result = crossEnvelope({
       mode: 'batch',
@@ -848,7 +861,7 @@ describe('independent R06 repaired-boundary cases', () => {
   it('keeps a successful text-only host envelope eligible for plan progress', async () => {
     const t = crossTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. Read src/a.ts', 1);
+    seedPlan(trace, '1. Read src/a.ts', 1);
     trace.startRound(2);
     await createToolPipeline().execute(
       { id: 'read', name: 'code', args: { action: 'read', params: { path: 'src/a.ts' } } },
@@ -861,7 +874,7 @@ describe('independent R06 repaired-boundary cases', () => {
   it('matches the exact file target despite sentence punctuation', () => {
     const p = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. Read src/auth.ts.', 1);
+    seedPlan(trace, '1. Read src/auth.ts.', 1);
     trace.startRound(2);
     trace.recordToolCall(
       'code',
@@ -875,7 +888,7 @@ describe('independent R06 repaired-boundary cases', () => {
   it('does not use a path substring as exact file completion', () => {
     const p = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. Read src/auth.ts', 1);
+    seedPlan(trace, '1. Read src/auth.ts', 1);
     trace.startRound(2);
     trace.recordToolCall(
       'code',
@@ -1220,7 +1233,8 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   it('does not raise a deviation replan while every round completes one planned step', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       [
         '1. 项目结构概览',
         '2. 搜索 auth 相关代码',
@@ -1260,7 +1274,7 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   it('fires a deviation replan only after three consecutive off-plan exploration rounds', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     runPlanRound(plans, trace, 2, [offPlanRead]);
     expect(plans.checkPlanning(planCheckState(3), trace)).toBeNull();
     runPlanRound(plans, trace, 3, [offPlanRead]);
@@ -1280,12 +1294,12 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   it('does not carry the deviation score or off-plan streak across a replan', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     for (const iteration of [2, 3, 4]) {
       runPlanRound(plans, trace, iteration, [offPlanRead]);
     }
     expect(plans.checkPlanning(planCheckState(5), trace)?.text).toContain('计划偏差检查');
-    trace.updatePlan('1. 阅读 src/unrelated.ts\n2. 阅读 src/billing.ts', 5);
+    seedPlan(trace, '1. 阅读 src/unrelated.ts\n2. 阅读 src/billing.ts', 5);
     runPlanRound(plans, trace, 5, [offPlanRead]);
     expect(plans.progress).toMatchObject({
       coveredSteps: 1,
@@ -1303,7 +1317,7 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   ])('keeps a capitalised bare %s file as a hard read target', (fileName) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. 阅读 ${fileName} 入口组件\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. 阅读 ${fileName} 入口组件\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [offPlanRead]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
@@ -1323,7 +1337,7 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   ])('still excludes technology names from file targets: %s', (plan) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(plan, 1);
+    seedPlan(trace, plan, 1);
     runPlanRound(plans, trace, 2, [offPlanRead]);
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
   });
@@ -1332,7 +1346,8 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   it('does not raise a deviation replan while the elicitation example plan keeps reading files', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       [
         '1. 获取项目概览和目录结构，识别核心模块',
         '2. 搜索网络请求相关类，分析请求模式',
@@ -1376,7 +1391,7 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   it('does not raise a deviation replan when only the summary step is left', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 搜索 auth 相关代码\n2. 阅读 src/auth.ts\n3. 总结分析发现', 1);
+    seedPlan(trace, '1. 搜索 auth 相关代码\n2. 阅读 src/auth.ts\n3. 总结分析发现', 1);
     runPlanRound(plans, trace, 2, [
       ['code', { action: 'search', params: { pattern: 'auth' } }, { total: 1, matches: [] }],
       ['code', { action: 'read', params: { path: 'src/auth.ts' } }, 'export class Auth {}'],
@@ -1394,7 +1409,7 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   it('holds the streak for unmatched exploration once only summary steps remain', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 总结分析发现', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 总结分析发现', 1);
     runPlanRound(plans, trace, 2, [
       ['code', { action: 'read', params: { path: 'src/auth.ts' } }, 'export class Auth {}'],
     ]);
@@ -1410,7 +1425,7 @@ describe('PlanTracker deviation metric (L6-P16 C16)', () => {
   it('still fires a deviation replan while tool-completable steps remain pending', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts\n3. 总结分析发现', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts\n3. 总结分析发现', 1);
     runPlanRound(plans, trace, 2, [
       ['code', { action: 'read', params: { path: 'src/auth.ts' } }, 'export class Auth {}'],
     ]);
@@ -1426,7 +1441,8 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('does not let code.search complete the summary step of the elicitation example plan', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       [
         '1. 获取项目概览和目录结构，识别核心模块',
         '2. 搜索网络请求相关类，分析请求模式',
@@ -1447,7 +1463,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('does not complete steps through single-character or substring keyword hits', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 按类型分类整理所有发现\n2. Check thread safety of workers', 1);
+    seedPlan(trace, '1. 按类型分类整理所有发现\n2. Check thread safety of workers', 1);
     runPlanRound(plans, trace, 2, [
       ['graph', { action: 'query', params: { type: 'class', entity: 'Alpha' } }, { name: 'Alpha' }],
       ['code', { action: 'read', params: { path: 'src/worker.ts' } }, 'export class Worker {}'],
@@ -1458,7 +1474,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('keeps multi-character class and word-bounded English keywords working', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 梳理 Vue.js 组件的类继承关系\n2. Read the worker entry file', 1);
+    seedPlan(trace, '1. 梳理 Vue.js 组件的类继承关系\n2. Read the worker entry file', 1);
     runPlanRound(plans, trace, 2, [
       [
         'graph',
@@ -1476,7 +1492,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   ])('lets a search complete a step that names a technology instead of a file: %s', (plan) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(plan, 1);
+    seedPlan(trace, plan, 1);
     runPlanRound(plans, trace, 2, [
       ['code', { action: 'search', params: { pattern: 'router.get' } }, { total: 0, matches: [] }],
     ]);
@@ -1486,7 +1502,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('treats file targets as a soft, prioritising signal for non-read tools', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 搜索 src/auth.ts 中的认证逻辑\n2. 搜索 src/billing.ts 中的计费逻辑', 1);
+    seedPlan(trace, '1. 搜索 src/auth.ts 中的认证逻辑\n2. 搜索 src/billing.ts 中的计费逻辑', 1);
     runPlanRound(plans, trace, 2, [
       [
         'code',
@@ -1506,7 +1522,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('keeps note_finding-only and failed-read rounds out of the off-plan streak', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     for (const iteration of [2, 3, 4]) {
       runPlanRound(plans, trace, iteration, [recordedFinding]);
     }
@@ -1521,7 +1537,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('holds (not resets) the off-plan streak across a round without countable actions', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     runPlanRound(plans, trace, 2, [offPlanRead]);
     runPlanRound(plans, trace, 3, [offPlanRead]);
     runPlanRound(plans, trace, 4, [recordedFinding, failedPlannedRead]);
@@ -1546,7 +1562,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('lets code.outline of the planned files complete and continue reading steps', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     runPlanRound(plans, trace, 2, [outline('src/auth.ts')]);
     runPlanRound(plans, trace, 3, [outline('src/payment.ts')]);
     runPlanRound(plans, trace, 4, [outline('src/auth.ts')]);
@@ -1558,7 +1574,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('keeps the file target a hard gate for code.outline', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     runPlanRound(plans, trace, 2, [outline('src/unrelated.ts')]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
@@ -1567,7 +1583,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('lets terminal.exec complete and continue command steps', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 运行 npm test 确认测试状态\n2. 执行 git log 查看最近提交', 1);
+    seedPlan(trace, '1. 运行 npm test 确认测试状态\n2. 执行 git log 查看最近提交', 1);
     runPlanRound(plans, trace, 2, [exec('npm test')]);
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
     runPlanRound(plans, trace, 3, [exec('git log -5')]);
@@ -1580,7 +1596,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('counts a code.search scoped to a reading step file target as on-plan', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     runPlanRound(plans, trace, 2, [
       [
         'code',
@@ -1595,7 +1611,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('does not treat a path that merely ends with the target name as naming it', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 auth.ts 认证入口\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 auth.ts 认证入口\n2. 阅读 src/payment.ts', 1);
     runPlanRound(plans, trace, 2, [
       [
         'code',
@@ -1609,7 +1625,7 @@ describe('PlanTracker step matching (L6-P16 C17)', () => {
   it('never lets code.outline or terminal.exec complete the summary step', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 总结分析发现\n2. 汇总报告结论', 1);
+    seedPlan(trace, '1. 总结分析发现\n2. 汇总报告结论', 1);
     runPlanRound(plans, trace, 2, [outline('src/auth.ts'), exec('npm test')]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
   });
@@ -1716,7 +1732,7 @@ describe('PlanTracker skipped actions are observable (L6-P16 C17)', () => {
     const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
     const t = new ExplorationTracker(STRATEGY_ANALYST, { maxIterations: 20 });
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
+    seedPlan(trace, '1. 阅读 src/auth.ts\n2. 阅读 src/payment.ts', 1);
     t.tick();
     trace.startRound(1);
     trace.recordToolCall(...recordedFinding, false);
@@ -1736,7 +1752,7 @@ describe('PlanTracker skipped actions are observable (L6-P16 C17)', () => {
     const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 Node.js 相关入口说明\n2. 总结分析发现', 1);
+    seedPlan(trace, '1. 阅读 Node.js 相关入口说明\n2. 总结分析发现', 1);
     runPlanRound(plans, trace, 2, [offPlanRead]);
     runPlanRound(plans, trace, 3, [offPlanRead]);
     runPlanRound(plans, trace, 4, [
@@ -1785,7 +1801,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   it('does not let an unrelated terminal command complete a reading step that mentions 执行流程', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/scheduler.ts 理解任务执行流程\n2. 阅读 src/server.ts', 1);
+    seedPlan(trace, '1. 阅读 src/scheduler.ts 理解任务执行流程\n2. 阅读 src/server.ts', 1);
     runPlanRound(plans, trace, 2, [exec('git status')]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
@@ -1799,7 +1815,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   ])('keeps the reading step "%s" pending after terminal.exec %s', (step, command) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec(command)]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
@@ -1808,7 +1824,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   it('keeps the production flat terminal parameter shape out of reading steps too', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/scheduler.ts 理解任务执行流程\n2. 阅读 src/server.ts', 1);
+    seedPlan(trace, '1. 阅读 src/scheduler.ts 理解任务执行流程\n2. 阅读 src/server.ts', 1);
     runPlanRound(plans, trace, 2, [
       [
         'terminal',
@@ -1822,7 +1838,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   it('completes the command step, not the 运行时 search step, when the plan has both', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 搜索运行时配置加载逻辑\n2. 运行 npm test 确认测试状态', 1);
+    seedPlan(trace, '1. 搜索运行时配置加载逻辑\n2. 运行 npm test 确认测试状态', 1);
     runPlanRound(plans, trace, 2, [exec('npm test')]);
     expect(stepStatuses(trace)).toEqual(['pending', 'done']);
     expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
@@ -1840,7 +1856,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   ])('still lets terminal.exec complete the command step "%s"', (step) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec('npm test')]);
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
@@ -1849,7 +1865,8 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   it('reports the deviation instead of listing an unread file as done after git log and off-plan reads', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       [
         '1. 获取项目概览和目录结构',
         '2. 阅读 src/runtime/AgentRuntime.ts 理解主循环执行流程',
@@ -1891,7 +1908,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   it('counts exploration after every plan step is done as off-plan, not as a vacuous plan exhaustion', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
+    seedPlan(trace, '1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
     runPlanRound(plans, trace, 2, [read('src/a.ts')]);
     runPlanRound(plans, trace, 3, [read('src/b.ts')]);
     expect(stepStatuses(trace)).toEqual(['done', 'done']);
@@ -1923,7 +1940,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   it('still sends the bootstrap deviation nudge once a compact plan without a summary step is finished', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
+    seedPlan(trace, '1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
     runPlanRound(plans, trace, 2, [read('src/a.ts')]);
     runPlanRound(plans, trace, 3, [read('src/b.ts')]);
     for (const [iteration, file] of [
@@ -1945,7 +1962,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
     const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
+    seedPlan(trace, '1. 阅读 src/a.ts 入口实现\n2. 阅读 src/b.ts 服务实现', 1);
     runPlanRound(plans, trace, 2, [read('src/a.ts'), read('src/b.ts')]);
     runPlanRound(plans, trace, 3, [read('src/x.ts')]);
     const messages = debug.mock.calls.map(([message]) => String(message));
@@ -1961,7 +1978,7 @@ describe('PlanTracker terminal rule boundary and completed plans (L6-P16r4)', ()
   it('keeps holding the streak while a summary step is the only open step', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/a.ts 入口实现\n2. 总结分析发现', 1);
+    seedPlan(trace, '1. 阅读 src/a.ts 入口实现\n2. 总结分析发现', 1);
     runPlanRound(plans, trace, 2, [read('src/a.ts')]);
     for (const iteration of [3, 4, 5]) {
       trace.startRound(iteration);
@@ -2012,7 +2029,7 @@ describe('PlanTracker terminal rule Latin objects (L6-P16r5)', () => {
   ])('keeps the reading step "%s" pending after terminal.exec %s', (step, command) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec(command)]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
@@ -2036,7 +2053,7 @@ describe('PlanTracker terminal rule Latin objects (L6-P16r5)', () => {
   ])('still lets terminal.exec complete the Latin command step "%s"', (step) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec('npm test')]);
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
@@ -2049,7 +2066,8 @@ describe('PlanTracker terminal rule Latin objects (L6-P16r5)', () => {
   ])('reports the deviation instead of listing "%s" as done after %s and off-plan reads', (step, command) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       [
         '1. 获取项目概览和目录结构',
         `2. ${step}`,
@@ -2134,7 +2152,7 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   ])('keeps the file-target step "%s" pending after terminal.exec %s', (step, command) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec(command)]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
@@ -2143,7 +2161,7 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   it('does not count an unrelated terminal command as continuing a done file-target step', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/cli/commands.ts 的参数解析\n2. 阅读 src/server.ts', 1);
+    seedPlan(trace, '1. 阅读 src/cli/commands.ts 的参数解析\n2. 阅读 src/server.ts', 1);
     runPlanRound(plans, trace, 2, [read('src/cli/commands.ts')]);
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
     runPlanRound(plans, trace, 3, [exec('ls')]);
@@ -2158,7 +2176,8 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   ])('reports the deviation instead of listing "%s" as done after %s and off-plan reads', (step, command) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       [
         '1. 获取项目概览和目录结构',
         `2. ${step}`,
@@ -2202,7 +2221,7 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   ])('still lets terminal.exec complete the command step "%s" without a file to inspect', (step) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec('npm test')]);
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
@@ -2211,7 +2230,7 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   it('completes the command step behind a gated file-target step in the same plan', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/cli/commands.ts 的参数解析\n2. 运行单元测试确认基线', 1);
+    seedPlan(trace, '1. 阅读 src/cli/commands.ts 的参数解析\n2. 运行单元测试确认基线', 1);
     runPlanRound(plans, trace, 2, [exec('npm test')]);
     expect(stepStatuses(trace)).toEqual(['pending', 'done']);
     expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
@@ -2220,7 +2239,8 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   it('keeps a step whose command also inspects another file behind the gate', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       '1. 运行 ./scripts/check.sh 并阅读 src/report.ts 的输出格式\n2. 阅读 src/server.ts',
       1
     );
@@ -2231,14 +2251,14 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
   it('still counts a terminal command that names the step file at a path boundary', () => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读命令行解析模块 src/cli.ts\n2. 阅读 src/server.ts', 1);
+    seedPlan(trace, '1. 阅读命令行解析模块 src/cli.ts\n2. 阅读 src/server.ts', 1);
     runPlanRound(plans, trace, 2, [exec('sed -n 1,80p src/cli.ts')]);
     // 点名文件是显式命中，不是语义回退。
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
     const gitLog = new PlanTracker();
     const gitTrace = new ActiveContext();
-    gitTrace.setPlan('1. 执行 git log src/auth.ts 查看修改历史\n2. 阅读 src/server.ts', 1);
+    seedPlan(gitTrace, '1. 执行 git log src/auth.ts 查看修改历史\n2. 阅读 src/server.ts', 1);
     runPlanRound(gitLog, gitTrace, 2, [exec('git log -5 -- src/auth.ts')]);
     expect(stepStatuses(gitTrace)).toEqual(['done', 'pending']);
   });
@@ -2247,7 +2267,11 @@ describe('PlanTracker terminal file-target gate (L6-P16r6)', () => {
     const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读 src/hooks/index.ts 理解执行 git hooks 的流程\n2. 阅读 src/server.ts', 1);
+    seedPlan(
+      trace,
+      '1. 阅读 src/hooks/index.ts 理解执行 git hooks 的流程\n2. 阅读 src/server.ts',
+      1
+    );
     runPlanRound(plans, trace, 2, [exec('ls')]);
     const gateLogs = debug.mock.calls
       .map(([message]) => String(message))
@@ -2293,7 +2317,7 @@ describe('PlanTracker terminal git-status anchor and executed-object exemption (
   ])('keeps the non-viewing git status step "%s" pending after terminal.exec ls', (step) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec('ls')]);
     expect(stepStatuses(trace)).toEqual(['pending', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 1, consecutiveOffPlan: 1 });
@@ -2306,7 +2330,7 @@ describe('PlanTracker terminal git-status anchor and executed-object exemption (
   ])('still lets terminal.exec complete the viewing step "%s"', (step) => {
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(`1. ${step}\n2. 阅读 src/server.ts`, 1);
+    seedPlan(trace, `1. ${step}\n2. 阅读 src/server.ts`, 1);
     runPlanRound(plans, trace, 2, [exec('ls')]);
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
     expect(plans.progress).toMatchObject({ unplannedActions: 0, consecutiveOffPlan: 0 });
@@ -2316,7 +2340,8 @@ describe('PlanTracker terminal git-status anchor and executed-object exemption (
     const step = '理解 git 状态机实现';
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan(
+    seedPlan(
+      trace,
       [
         '1. 获取项目概览和目录结构',
         `2. ${step}`,
@@ -2358,7 +2383,7 @@ describe('PlanTracker terminal git-status anchor and executed-object exemption (
 
     const plans = new PlanTracker();
     const trace = new ActiveContext();
-    trace.setPlan('1. 阅读并运行 scripts/check.sh 理解检查逻辑\n2. 阅读 src/server.ts', 1);
+    seedPlan(trace, '1. 阅读并运行 scripts/check.sh 理解检查逻辑\n2. 阅读 src/server.ts', 1);
     runPlanRound(plans, trace, 2, [exec('ls')]);
     // 匹配行为不变（豁免仍让语义回退完成步骤），只是这条分叉路径现在可回放。
     expect(stepStatuses(trace)).toEqual(['done', 'pending']);
@@ -2375,7 +2400,7 @@ describe('PlanTracker terminal git-status anchor and executed-object exemption (
     debug.mockClear();
     const plain = new PlanTracker();
     const plainTrace = new ActiveContext();
-    plainTrace.setPlan('1. 运行单元测试\n2. 阅读 src/server.ts', 1);
+    seedPlan(plainTrace, '1. 运行单元测试\n2. 阅读 src/server.ts', 1);
     runPlanRound(plain, plainTrace, 2, [exec('ls')]);
     expect(stepStatuses(plainTrace)).toEqual(['done', 'pending']);
     expect(exemptionLogs()).toEqual([]);
@@ -2412,6 +2437,23 @@ describe('PlanTracker trace port (L6-P16 C19)', () => {
     ];
     plans.updatePlanProgress(trace);
     expect(steps[0].status).toBe('done');
+  });
+
+  it('treats an action without a receipt as successful on the trace port', () => {
+    // ActiveContext 的旧 addAction（无回执）已删除（W2a-10），recordToolCall 总会写入 ok；
+    // 端口的其他实现仍可能不填 ok，PlanTracker 只跳过 ok===false，缺席按成功计入计划进度。
+    const steps = [{ description: 'Read src/auth.ts', status: 'pending', keywords: [] }];
+    const trace: ExplorationTrace = {
+      getPlan: () => ({ createdAtIteration: 1, steps }),
+      getPlanStepsMutable: () => steps,
+      getCurrentRoundActions: () => [
+        { tool: 'code', params: { action: 'read', params: { path: 'src/auth.ts' } } },
+      ],
+    };
+    const plans = new PlanTracker();
+    plans.updatePlanProgress(trace);
+    expect(steps[0].status).toBe('done');
+    expect(plans.progress.consecutiveOffPlan).toBe(0);
   });
 
   it('keeps a single trace port without the duplicated ActiveTrace type or casts', () => {

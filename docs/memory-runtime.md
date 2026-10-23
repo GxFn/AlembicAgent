@@ -18,13 +18,13 @@ L4 使用结构化记忆包，成功替换前重新核对消息快照与读取�
 
 `EpisodicConsolidator` 先提取候选；`clearPrevious=true` 经现有 `consolidate` 选项 `clearPreviousBootstrap` 传递，在同一 SQLite 事务中清理旧 bootstrap 记忆、维护和写入新候选。提取失败不触及存储，任一写入失败整体回滚。默认 `PersistentMemory` 支持该选项；自定义语义记忆端口须实现同样的原子替换语义。普通 `clearBootstrapMemories()` 入口仍保留。
 
-同批候选按顺序解决冲突，每个候选都能看到本事务中前一个候选的写入。固化、scope 创建、记忆读取及检查点日志属于观察通道，异常或异步拒绝不会覆盖已确认结果。
+同批候选按顺序解决冲突，每个候选都能看到本事务中前一个候选的写入。固化、scope 创建与记忆读取的日志属于观察通道，异常或异步拒绝不会覆盖已确认结果。
 
-`SessionStore.storeDimensionReport()` 在校验完整新报告后替换该报告及其派生证据、交叉引用；独立 `addEvidence()` 数据保留。检查点中的 `reportDimId` 标识派生索引归属，普通证据查询会移除此内部字段。旧快照通过原报告匹配已有索引，旧 `E-id=path` 键归一到真实路径。查询、Producer 投影和 `toJSON()` 返回独立快照；顶层项目便捷配置与 `projectContext` 合并，显式 `projectContext` 优先。
+`SessionStore.storeDimensionReport()` 在校验完整新报告后替换该报告及其派生证据、交叉引用；旧快照恢复出的、不属于任何报告的独立证据保留。快照中的 `reportDimId` 标识派生索引归属，普通证据查询会移除此内部字段。旧快照通过原报告匹配已有索引，旧 `E-id=path` 键归一到真实路径。查询、报告投影和 `toJSON()` 返回独立快照；顶层项目便捷配置与 `projectContext` 合并，显式 `projectContext` 优先。无生产调用的 `addEvidence()`、`getEvidenceForFile()`、`buildContextSnapshot()` 与 `getDistilledForProducer()` 已随 W2a-10 删除，证据检索走 `searchEvidence()`。
 
-报告输入的 `digest` 为三态：缺省时沿用该维度已有 digest 并按它重建交叉引用（续跑先恢复 digest、再恢复报告文本时不丢失），显式 `null` 才清空，对象则严格校验后整体替换。`addDimensionDigest()` 与 `addTierReflection()` 的输入来自 AI 回复或宿主检查点，入口先归一化（非字符串的 crossRefs 值、非法 keyFindings/gaps/topFindings 项丢弃，类型错误的数组字段置为空数组，非字符串 summary 置为空串，非数字 candidateCount 删除），每次调用汇总一条含维度/层、字段与原始类型的 warn；整体不是对象时抛出 Error 且不改动状态。快照恢复（`fromJSON()`、`loadCheckpoint()`）对缺失字段补默认值，字段存在但类型错误或报告 `dimId` 与键不一致时拒绝恢复。
+报告输入的 `digest` 为三态：缺省时沿用该维度已有 digest 并按它重建交叉引用（续跑先恢复 digest、再恢复报告文本时不丢失），显式 `null` 才清空，对象则严格校验后整体替换。`addDimensionDigest()` 与 `addTierReflection()` 的输入来自 AI 回复或宿主检查点，入口先归一化（非字符串的 crossRefs 值、非法 keyFindings/gaps/topFindings 项丢弃，类型错误的数组字段置为空数组，非字符串 summary 置为空串，非数字 candidateCount 删除），每次调用汇总一条含维度/层、字段与原始类型的 warn；整体不是对象时抛出 Error 且不改动状态。快照恢复（`fromJSON()`，与 `validateSessionStoreShape()` 同一套规则）对缺失字段补默认值，字段存在但类型错误或报告 `dimId` 与键不一致时拒绝恢复。
 
-检查点先写同目录临时文件，再 rename 替换目标；写入或重命名失败保留上次有效文件并抛出错误。注入 WriteZone 时写入、重命名与清理走同一边界。`MemoryCoordinator.checkpoint()` 仍是记录失败诊断的兼容便利入口，需要确认持久化的宿主应直接等待 `saveCheckpoint()`。这提供原子文件替换，不宣称跨进程事务或断电持久性。
+会话持久化只有 `SessionStore.toJSON()` / `fromJSON()` 快照：宿主断点续跑自行保存快照并经 `fromJSON()` 恢复，会话结束时只 dispose SessionStore。原先写入 `.asd/bootstrap-checkpoint/` 的检查点文件链（`SessionStore.saveCheckpoint()` / `loadCheckpoint()` 及其原子写、`MemoryCoordinator.checkpoint()` / `restore()`）没有生产调用方，已随 W2a-10（审阅包 L6-P25）删除；`MemoryCoordinator` 的 `completeDimension()`、`completeSession()`、`extractFromConversation()`、`getPersistentMemory()` 与 `dispose()` 一并删除，scope 只经 `createDimensionScope()` 创建并随会话级 coordinator 回收。`ActiveContext` 只保留 `recordToolCall()` 记录入口与 `expectPlan()` + `extractAndSetPlan()` 计划入口，旧 RT/WM 入口、计划直写方法与静态 `fromJSON()` 已删除。
 
 `ConversationStore` 使用同一个 data zone 读取和写入；损坏的 JSONL 记录逐条跳过并报告，合法相邻记录保留。读取预算包含截断标记，过长摘要不挤掉最近消息。本类不再生成摘要（W2a-09 删除了摘要、列表、删除、过期清理与 token 估算方法，宿主只用 create / append / load）；旧版本写入的 `[对话摘要]` 在读取时仍按上述规则保留，自动登记未知 id 时也据此推断 `hasSummary`。
 
