@@ -902,6 +902,15 @@ function loadSourceFixture(fixture) {
   };
 }
 
+/**
+ * 仓内规范哈希的脚本侧副本：`sha256:` + 与 src/agent/production/strict/primitives.ts 的
+ * hashCanonical 逐字节相同的裸 hex。sourceRevisionVectorHash 等由这里算出的哈希会交给生产实现
+ * （lineage 等）比较，因此两边必须一致。
+ *
+ * 本脚本不经编译、不能导入 src，所以保留本地实现；逐字节等价由
+ * test/strict-canonical-golden.test.ts 在 golden 输入与 hu/da/lt 默认区域下钉住，那里只读取
+ * hash/sha256/sortCanonical 三个顶层函数声明，改名或新增依赖时须同步该守护。
+ */
 function hash(value) {
   return `sha256:${sha256(JSON.stringify(sortCanonical(value)))}`;
 }
@@ -910,6 +919,11 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+/**
+ * 与 primitives.ts 的 sortCanonical 相同：键排序固定为 en 排序规则，不随进程默认区域变化
+ * （匈牙利语、丹麦语、立陶宛语等区域对 cs/cz、aa/z、y/iz 这类 ASCII 键的顺序不同）。
+ * 事项⑥已答复（2026-10-20）：本轮只收敛副本、不改排序。
+ */
 function sortCanonical(value) {
   if (Array.isArray(value)) {
     return value.map(sortCanonical);
@@ -919,7 +933,8 @@ function sortCanonical(value) {
   }
   return Object.fromEntries(
     Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
+      // 固定 en 排序规则：与 primitives 逐字节一致，且不随进程默认区域变化。
+      .sort(([left], [right]) => left.localeCompare(right, 'en'))
       .map(([key, child]) => [key, sortCanonical(child)])
   );
 }

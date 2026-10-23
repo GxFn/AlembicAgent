@@ -105,7 +105,8 @@ function stringArray(value: unknown): string[] {
  *     进程里撰写过这类配方，重新撰写后顺序可能改变，profileHash / documentSetHash 也随之改变；
  *   - 部分区域（如 hu、da、lt）对某些 ASCII 组合（cs/cz、aa/z、y/iz 等）的历史顺序本就与 en
  *     不同，含这些组合的配方重新撰写后同样会改变。
- * 是否改为码元序、以及已持久化哈希如何迁移，属于待决事项⑥；在那之前不改这里的排序规则。
+ * 事项⑥已答复（2026-10-20）：本轮只收敛副本、不改排序，这里的排序规则与已持久化的哈希保持不变；
+ * 改为码元序及配套的哈希迁移需另行决定。
  */
 function distinctSorted(values: string[]): string[] {
   return [...new Set(values.map(text).filter(Boolean))].sort((left, right) =>

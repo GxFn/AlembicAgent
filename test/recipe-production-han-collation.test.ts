@@ -9,7 +9,8 @@ import { createTempProject } from './helpers/tempProject.js';
  * 不含汉字的引用成立。evidenceRefs 是项目相对路径、sourceFieldRefs 是字段名，二者都可能含汉字；
  * zh 区域把汉字排在拉丁字母之前，en 排在之后。所以中文默认区域进程里撰写过、且引用含汉字的
  * 配方，重新撰写后 provenance 顺序变化，Core 的 profileHash / documentSetHash 随之改变。
- * 这里把这个影响面钉成事实（不改排序：迁移属于待决事项⑥），并要求注释如实写出它。
+ * 这里把这个影响面钉成事实（不改排序：事项⑥已答复（2026-10-20），本轮只收敛副本、不改排序），
+ * 并要求注释如实写出它。
  */
 
 /** 模拟默认区域不同的进程：未显式指定 locale 的比较改用给定区域的排序规则。 */
@@ -101,7 +102,9 @@ describe('recipe provenance order under a Chinese default locale (L4-P2)', () =>
     const head = source.slice(0, index).trimEnd();
     const doc = head.slice(head.lastIndexOf('/**'));
     expect(doc).not.toContain('英文、中文环境下与历史顺序一致，');
-    for (const fact of ['汉字', 'profileHash', 'documentSetHash', '待决事项⑥']) {
+    // 事项⑥已答复（2026-10-20）：注释不得再把它写成待决。
+    expect(doc).not.toContain('待决事项⑥');
+    for (const fact of ['汉字', 'profileHash', 'documentSetHash', '事项⑥已答复']) {
       expect(doc).toContain(fact);
     }
   });

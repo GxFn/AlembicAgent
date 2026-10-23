@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import path, { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
@@ -41,6 +41,9 @@ import type { AgentRunResult } from '../src/agent/service/AgentRunContracts.js';
  *   （`plan-cognition-receipt-` 前缀）。
  *
  * 收敛后四个调用点都复用 primitives 的 hashCanonical，各自保留前缀语义，同一组常量必须全部通过。
+ * 第 6 份副本在 scripts/eval-strict-production.mjs（W1-10r1，C46）：脚本不经编译、不能导入 src，
+ * 保留本地实现但同样固定 en 排序；文件末尾的对照用例在 SHARED_GOLDEN 上、并在 hu/da/lt 默认区域
+ * 下要求它与 primitives 逐字节一致（改前它随进程默认区域变化）。
  * 任何字节差异都会让冻结回执被误判篡改、golden 报告哈希漂移：此时应停止并回报，不得改常量。
  * PlanAgentRun 的 receiptId 还经过 prompt 的 inputHash 与 Core hashStrictPlanIntentV1，那两者
  * 有意变化时须单独说明理由后重录，规范哈希本身的常量（SHARED_GOLDEN）不随之改动。
@@ -664,5 +667,139 @@ describe('canonical hash copies are converged into primitives', () => {
     const surface = readCanonicalSurface(file);
     expect(surface.declaredFunctions, file).toEqual([]);
     expect(surface.primitivesImports, file).toContain('hashCanonical');
+  });
+});
+
+/* ── 第 6 份副本：scripts/eval-strict-production.mjs（W1-10r1，C46）────────────────────────── */
+
+const EVAL_SCRIPT_FILE = fileURLToPath(
+  new URL('../scripts/eval-strict-production.mjs', import.meta.url)
+);
+/** 脚本副本由这三个顶层函数组成：hash 拼 `sha256:` 前缀，sha256 取裸 hex，sortCanonical 排键。 */
+const EVAL_SCRIPT_CANONICAL_FUNCTIONS: readonly string[] = ['hash', 'sha256', 'sortCanonical'];
+
+interface EvalScriptCanonicalCopy {
+  readonly hash: (value: unknown) => string;
+  readonly sortCanonical: (value: unknown) => unknown;
+}
+
+function isEvalScriptCanonicalCopy(value: unknown): value is EvalScriptCanonicalCopy {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'hash' in value &&
+    typeof value.hash === 'function' &&
+    'sortCanonical' in value &&
+    typeof value.sortCanonical === 'function'
+  );
+}
+
+/**
+ * 取出 eval-strict-production 脚本里的规范哈希副本，供逐字节对照。
+ *
+ * 脚本是不经编译的 .mjs，顶层会 await 导入 dist、逐个跑 fixture 并写报告，不能被测试直接导入；
+ * 为了导出纯函数而给脚本加“是否主模块”的分叉会改动整条顶层流程。这里改为用 TypeScript AST
+ * 只读取它的三个顶层函数声明的源码，再用 Function 构造器在本测试的同一 realm 里求值，只注入
+ * createHash：不执行脚本主流程、不依赖 dist，函数改名或多出未注入的依赖时在这里直接失败。
+ * 同一 realm 保证 simulateDefaultLocale 对 String.prototype.localeCompare 的替换也作用到脚本副本
+ * （vm 新上下文或 vmThreads 池会让模拟静默失效）。
+ */
+function loadEvalScriptCanonicalCopy(): EvalScriptCanonicalCopy {
+  const source = ts.createSourceFile(
+    EVAL_SCRIPT_FILE,
+    readFileSync(EVAL_SCRIPT_FILE, 'utf8'),
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.JS
+  );
+  const declarations = source.statements.filter(
+    (statement): statement is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(statement) &&
+      statement.name !== undefined &&
+      EVAL_SCRIPT_CANONICAL_FUNCTIONS.includes(statement.name.text)
+  );
+  // 每个函数恰好声明一次；缺失或重复都说明副本形状变了，需要先回到这里核对。
+  expect(declarations.map((declaration) => declaration.name?.text).sort()).toEqual([
+    ...EVAL_SCRIPT_CANONICAL_FUNCTIONS,
+  ]);
+  const body = [
+    "'use strict';",
+    ...declarations.map((declaration) => declaration.getText(source)),
+    'return { hash, sortCanonical };',
+  ].join('\n');
+  // Function 构造器返回 Function；目标签名由上面读到的函数声明决定，返回值再经类型守卫确认。
+  const factory = new Function('createHash', body) as (inject: typeof createHash) => unknown;
+  const copy = factory(createHash);
+  if (!isEvalScriptCanonicalCopy(copy)) {
+    throw new Error(`eval script canonical copy is not callable: ${EVAL_SCRIPT_FILE}`);
+  }
+  return copy;
+}
+
+/** 每个模拟区域都确实改变了未固定区域的比较结果，否则下面的区域用例会空转通过。 */
+const LOCALE_SENSITIVE_PAIRS: Record<string, readonly [string, string]> = {
+  hu: ['cs', 'cz'],
+  da: ['aa', 'z'],
+  lt: ['iz', 'y'],
+};
+
+function expectEvalScriptCopyOnGolden(copy: EvalScriptCanonicalCopy, label: string) {
+  for (const name of Object.keys(SHARED_GOLDEN) as PayloadName[]) {
+    const golden = SHARED_GOLDEN[name];
+    expect(JSON.stringify(copy.sortCanonical(PAYLOADS[name])), `${label}:${name}`).toBe(
+      golden.text
+    );
+    expect(copy.hash(PAYLOADS[name]), `${label}:${name}`).toBe(`sha256:${golden.hash}`);
+    expect(copy.hash(PAYLOADS[name]), `${label}:${name}`).toBe(
+      `sha256:${hashCanonical(PAYLOADS[name])}`
+    );
+  }
+}
+
+describe('eval-strict-production script canonical copy stays byte-identical to primitives', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('matches the shared golden under the process default collation', () => {
+    expectEvalScriptCopyOnGolden(loadEvalScriptCanonicalCopy(), 'default');
+  });
+
+  it.each([
+    'hu',
+    'da',
+    'lt',
+  ])('matches the shared golden when the process default collation is %s', (locale) => {
+    const copy = loadEvalScriptCanonicalCopy();
+    simulateDefaultLocale(locale);
+    const pair = LOCALE_SENSITIVE_PAIRS[locale];
+    expect(pair, locale).toBeDefined();
+    if (pair) {
+      // 未固定区域时该组合的顺序与 en 相反，证明模拟已生效。
+      expect(pair[0].localeCompare(pair[1]), locale).toBeGreaterThan(0);
+      expect(pair[0].localeCompare(pair[1], 'en'), locale).toBeLessThan(0);
+    }
+    expectEvalScriptCopyOnGolden(copy, locale);
+  });
+});
+
+/* ── 事项⑥已答复（2026-10-20）：源码注释不得再把它写成待决 ──────────────────────────────── */
+
+function listSourceFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const target = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      return listSourceFiles(target);
+    }
+    return target.endsWith('.ts') ? [target] : [];
+  });
+}
+
+describe('decision ⑥ is recorded as answered in source comments', () => {
+  it('leaves no src comment calling decision ⑥ pending', () => {
+    const stale = listSourceFiles(SRC_ROOT)
+      .filter((file) => readFileSync(file, 'utf8').includes('待决事项⑥'))
+      .map((file) => path.relative(SRC_ROOT, file));
+    expect(stale).toEqual([]);
   });
 });
