@@ -3248,7 +3248,7 @@ describe('terminal.exec dangerous-command blacklist audit follow-up (L4-P8c)', (
     "find . -name '*.ts' -exec grep -l sudo {} +",
     'rg -n sudo src # find sudo usage',
     '# check eval usage\nrg -n eval src',
-    // 词边界：更长的单词与路径片段不算命中。
+    // 词边界：更长的单词与文件名不算命中；W-SEC1 起路径写法（./docs/sudo）算命中，但它是 cat 的参数，照常放行。
     'cat ./docs/sudo',
     'rg -n sudoers src',
     'npm run lint:su-check',

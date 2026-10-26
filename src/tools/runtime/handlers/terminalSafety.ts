@@ -4,15 +4,23 @@
  * 1. checkTerminalCommandSafety —— 危险命令黑名单。它是启发式纵深防御，不是写边界：
  *    真正限制写入范围的是宿主注入的 sandbox profile（project-write 沙箱）；rm -r、find -delete、
  *    git clean 等删除按设计不归这里拦截。DENIED_BINS 与 eval 走双重判定，任一命中即拒绝（L4-P8c）：
- *    (a) 不依赖词法器的兜底：对每一层命令串的原始文本做词边界正则匹配（名字前是行首、空白、; | & ( ) 或
- *        反引号，可带一个引号），命中后只有 token 判定确认它是只读取证命令（rg/grep/git log 等）的参数、
- *        查询类 wrapper 的操作数、注释，或已在嵌套层单独检查过的 shell 命令串时才放行并记诊断；命令替换体里
- *        的命中按承载替换的外层词判定，放行的命中词还要求其输出（管道、进程替换、coproc、同一命令里写出的
- *        文件）只流向惰性程序，不流向会执行它的命令；
+ *    (a) 不依赖词法器的兜底：把每一层命令串的原始文本按空白、; & | ( ) < > 与反引号切成块（反斜杠连同其后
+ *        一个字符不切开，续行同样不切开），每块按宽松的去引号读法还原（删去引号与转义反斜杠、解码 $'...'），
+ *        还原值再按空白、换行与上述运算符切片，逐片按命令名规范化（取最后一个 '/' 之后的名字、小写、GNU g 前缀、
+ *        mkfs.<fstype>、提权程序名族）后与 DENIED_BINS/eval 比较（W-SEC1）。所以路径写法（/usr/bin/sudo、
+ *        ../bin/sudo）、转义写法（\sudo、s\udo、su\<换行>do）、引号拼接（s''udo、"/sbin/"reboot）、ANSI-C 引号
+ *        （$'\x73udo'）、名字族变体（sudo-rs、sudo.ws）以及被转义的分隔符连起来的名字（'sh -c id\;sudo'、
+ *        'ssh host sudo\ reboot'、$'id\x3bsudo'：交给 sh -c、ssh 再切词时分隔符重新生效）都命中。命中后只有
+ *        token 判定确认它是只读取证命令（rg/grep/git log 等，以及只查手册页的 man）的参数、查询类 wrapper 的
+ *        操作数、注释，或已在嵌套层单独检查过的 shell 命令串时才放行并记诊断；命令替换体里的命中按承载替换的
+ *        外层词判定，放行的命中词还要求其输出（管道、进程替换、coproc、同一命令里写出的文件）只流向惰性程序，
+ *        不流向会执行它的命令；
  *    (b) token 级判定：命令位置（含已知执行 wrapper、引导命令的保留字、shell 命令串、find -exec 动作、
- *        命令替换体）上的 DENIED_BINS、eval 与 rm 递归强删。
+ *        命令替换体）上的 DENIED_BINS、eval 与 rm 递归强删；命令名经同一规范化，路径写法与名字族变体同样识别。
  *    别名、脚本文件内容、node -e/python -c/awk system() 这类解释器内代码、不在 EXEC_WRAPPERS 里的 wrapper
- *    都不求值，属于 (b) 的已知盲区，其中字面出现的 DENIED_BINS/eval 由 (a) 兜底。
+ *    都不求值，属于 (b) 的已知盲区，其中字面出现（含上述路径、转义、引号与名字族写法）的 DENIED_BINS/eval
+ *    由 (a) 兜底。运行时才拼出的名字不在兜底范围内：参数展开（su${E}do）、花括号展开（s{u,}do）、路径名通配
+ *    （/usr/bin/su?o）与命令替换的输出（$(printf ...)）都不求值，选项值粘连写法（--pre=sudo、-Psudo）也不切开。
  *    命令替换的输出决定执行身份、wrapper 结构、rm 选项、shell 命令串或 find 表达式时静态无法判定，
  *    一律 fail-closed；参数展开（$VAR、"$@"、${VAR}）出现在命令位置、wrapper 结构或 -c 命令串里时同样
  *    fail-closed（展开为空或多个词会改变执行身份与切分）。shell（及 source/.）从 stdin 或运行时描述符读程序
@@ -35,9 +43,16 @@ import path from 'node:path';
 import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 
+/**
+ * 被禁程序的规范名。提权类（sudo、su、doas、pkexec、run0）另按名字族识别（sudo-rs、sudo.ws、sudoedit 等，
+ * 判定口径见 privilegeFamilyRoot）；mkfs 覆盖 mkfs.<fstype>。命令名先经 normalizeBinName 规范化再比较。
+ */
 export const DENIED_BINS = new Set([
   'sudo',
   'su',
+  'doas',
+  'pkexec',
+  'run0',
   'shutdown',
   'reboot',
   'halt',
@@ -194,6 +209,7 @@ const BIN_DASH_SYNTAX = new Map<string, DashSyntax>([
     'pnpm',
     'yarn',
     'sed',
+    'man',
   ].map((bin) => [bin, 'cluster'] as const),
 ]);
 
@@ -404,6 +420,44 @@ const SED_OPTION_TABLE = riskOptionTable({
   abbreviations: [['inplace', 1, 'write']],
 });
 
+const MAN_OPTION_TABLE = riskOptionTable({
+  // man 不在 Evolution allowlist，只供危险命令黑名单 (a) 兜底判定“只查手册页”（W-SEC1，见 isManualPageLookup）。
+  // macOS 的 man 是 shell 脚本：-P 分页器与 -C 配置文件里的变量都交给 eval，-M 换手册路径后找到的页面路径同样
+  // 进 eval；man-db 的 -P/--pager、-H/--html（浏览器）、-X/--gxditview 运行外部程序，-C/--config-file 可改分页器，
+  // -l/--local-file 格式化任意文件，-p/--preprocessor 选预处理器，-c/--catman 与 -u/--update 写缓存。
+  // 单字母按短选项簇逐字母、不区分大小写比较，-h 帮助、-L 语言、-m 其它系统手册也一并拒绝，不损失取证能力。
+  names: {
+    write: ['u', 'catman'],
+    exec: [
+      'p',
+      'c',
+      'm',
+      'h',
+      'x',
+      'l',
+      'pager',
+      'html',
+      'gxditview',
+      'configfile',
+      'manpath',
+      'localfile',
+      'preprocessor',
+    ],
+    network: [],
+  },
+  // man-db 用 argp，接受无歧义的长选项前缀（--pa 即 --pager；--pr 与 --prompt 有歧义，--pre 才是 --preprocessor）。
+  abbreviations: [
+    ['pager', 2, 'exec'],
+    ['preprocessor', 3, 'exec'],
+    ['html', 2, 'exec'],
+    ['gxditview', 1, 'exec'],
+    ['configfile', 2, 'exec'],
+    ['catman', 2, 'write'],
+    ['manpath', 3, 'exec'],
+    ['localfile', 6, 'exec'],
+  ],
+});
+
 const VITEST_OPTION_TABLE = riskOptionTable({
   // vitest 4.1 的 --help 全量核对：-u 更新快照、--attachmentsDir 写附件；-c/--config、--execArgv、--diff、
   // --root/--dir（可指向项目外的配置或测试集）、--experimental（含自定义 vcsProvider 与模块缓存）会加载执行
@@ -473,6 +527,7 @@ const BIN_OPTION_TABLES = new Map<string, OptionTable>([
   ['eslint', ESLINT_OPTION_TABLE],
   ['biome', BIOME_OPTION_TABLE],
   ['sed', SED_OPTION_TABLE],
+  ['man', MAN_OPTION_TABLE],
   ['vitest', VITEST_OPTION_TABLE],
   ['jest', JEST_OPTION_TABLE],
 ]);
@@ -868,7 +923,7 @@ const MAX_TERMINAL_COMMAND_LENGTH = 32_768;
  * - rm 合并旗标（rm -rf）出现在任意位置，包括解释器代码与引号内（awk/perl/python 里的 system 调用）；
  * - curl/wget 输出经管道交给 shell；
  * - fork bomb 函数定义。
- * sudo/su/dd 等 DENIED_BINS 与 eval 的词边界正则（DENIED_NAME_PATTERN）不在这里：它命中后还要用 token
+ * sudo/su/dd 等 DENIED_BINS 与 eval 的原始文本兜底（findDeniedNameHits）不在这里：它命中后还要用 token
  * 判定排除 'rg -n sudo src'、'git log --grep su'、'ls dd' 这类取证命令，见 checkDeniedNameFallback。
  */
 export function detectDangerousShellPayload(payload: string): TerminalSafetyBlock | null {
@@ -1051,16 +1106,29 @@ function lexShellReadings(command: string): ShellReading[] | { block: TerminalSa
 }
 
 /*
- * (a) DENIED_BINS/eval 的词边界正则兜底（L4-P8c）
+ * (a) DENIED_BINS/eval 的原始文本兜底（L4-P8c；W-SEC1 改为切块还原）
  *
  * token 级判定曾被连续绕过（heredoc、注释、参数展开前缀、xargs 运行时参数），所以对每一层命令串的原始文本
- * 再做一次不依赖词法器的匹配：名字前是行首、空白、; | & ( ) 或反引号（'$(' 由 '(' 覆盖，wrapper 名之后
- * 由空白覆盖），可带一个引号；名字后是行尾、空白、运算符、反引号或重定向符。eval 沿用 L4-P8 之前的口径，
- * 只在其后还跟着参数时才算命中（单独的 eval 什么也不执行，'npm run eval' 不该被拦）。'=sudo'、'/sudo'、
- * 'sudoers' 这类不在命令位置形态的写法不算命中。
+ * 再做一次不依赖词法器的匹配。L4-P8c 的词边界正则只认名字前是行首、空白、; | & ( ) 或反引号（可带一个引号），
+ * 审计（W-SEC1）确认 '/usr/bin/sudo'、'\sudo'、's\udo' 都不命中，未知 wrapper 承载时（'caffeinate /usr/bin/sudo -i'、
+ * 'flock /tmp/l /bin/dd ...'）(b) 不解包、(a) 又不命中，生产路径放行。现在改为：
+ * 1. 切块：按空白、; & | ( ) < > 与反引号切开原始文本；反斜杠连同其后一个字符属于同一块（'\ '、'\;' 不切开，
+ *    与 shell 一致），续行（反斜杠+换行）同样不切开。这与旧正则的边界并不一致：旧正则只看名字前一个字符，
+ *    '\;sudo' 里的 ';' 算边界，块却把 'id\;sudo' 留在一起，所以第 3 步要在还原后再切片。引号内的空白照样切开，
+ *    所以 'ssh host "sudo reboot"' 这类会被再次切词的引号串里的名字也能命中。
+ * 2. 还原（decodeRawChunk）：宽松的去引号读法——删去单双引号与转义反斜杠（引号内的反斜杠也删，经 ssh、
+ *    su -c 再切词时它就是转义）、删去续行、解码 $'...'（未闭合时解码到块尾）、$"..." 去掉 '$'。
+ * 3. 切片（collectChunkHits，W-SEC1 返工）：还原值再按同一组分隔符（空白、换行、; & | ( ) < > 与反引号）切片。
+ *    被转义的分隔符（'id\;sudo'、'sudo\ -i'、'true\&\&dd'）与 $'...' 解码出的分隔符（$'id\x3bsudo'）在外层
+ *    shell 里不切词，但这个词交给 sh -c、ssh、su -c 这类会再切词的宿主时就重新生效。
+ * 4. 规范化（normalizeBinName）：逐片取最后一个 '/' 之后的名字（任意目录前缀）、小写、GNU g 前缀、mkfs.<fstype>、
+ *    提权程序名族（sudo-rs、sudo.ws 等，见 privilegeFamilyRoot），再与 DENIED_BINS 比较。eval 沿用 L4-P8 之前
+ *    的口径，只在其后还跟着参数时才算命中（单独的 eval 什么也不执行，'npm run eval' 不该被拦）；片在还原值中间时
+ *    看还原值里其后的文本，片在块尾时看原始文本里块之后的文本（evalArgumentFollows）。
+ * '=sudo'、'--pre=sudo' 这类名字前没有 '/' 的粘连写法、'sudoers' 这类更长的单词、'sudo.md' 这类文件名不算命中。
  * 为了不回到 I31 的误拦（'rg -n sudo src'），命中后用 token 判定逐个确认，全部确认才放行并记诊断：
  * - 命中词是只读取证命令（EVIDENCE_COMMAND_BINS，且没有执行/写盘类选项、git 只认只读子命令）的参数，
- *   包括 wrapper 解包后的目标与 find -exec 动作里的命令；
+ *   包括 wrapper 解包后的目标与 find -exec 动作里的命令；只查手册页的 man（isManualPageLookup）同样放行；
  * - 命中词是查询类 wrapper（command -v、--help）的操作数，整条命令不执行任何目标；
  * - 命中落在注释读法的注释里，或落在 shell/source/trap 的参数（含交给 shell 的 here-string）里：
  *   这些文本已作为独立命令串在嵌套层递归检查，嵌套层同样跑本兜底；
@@ -1070,17 +1138,27 @@ function lexShellReadings(command: string): ShellReading[] | { block: TerminalSa
  * 或同一命令里写出的文件交给非惰性程序时拒绝（'echo "sudo reboot" | xargs caffeinate'）。
  * 其余位置（命令名、wrapper 选项值、赋值前缀、env -S 串、重定向目标、非取证命令的参数）一律拒绝。
  * 任一解读（'&>' 两种读法、注释两种读法、规格外选项的多个候选）里无法确认都拒绝。
+ * 块的起点必然落在词法器切出的某个词的区间里（块边界是词边界的超集，只多切了引号内的空白与运算符），
+ * 同一块切出的各片命中都记在块起点上，所以 findWordAt 能把命中映射回承载它的词，归属判定不因切片而变；
+ * 切块、还原、切片与规范化都与块长成线性，整条命令的成本与长度成线性。
  */
-const DENIED_NAME_PATTERN = new RegExp(
-  `(?:^|[\\s;&|()\`])["']?(?:(${[...DENIED_BINS]
-    .map((name) => (name === 'mkfs' ? 'mkfs(?:\\.[\\w-]+)?' : name))
-    .join('|')})["']?(?=$|[\\s;&|()\`<>])|(eval)["']?(?=[ \\t]+[^\\s;&|()<>#]))`,
-  'dgi'
-);
+// 切块与切片共用的分隔符：空白（含换行）、; & | ( ) < > 与反引号。
+const RAW_CHUNK_BREAK = /[\s;&|()`<>]/;
+// eval 之后紧跟（同一行的）空白与一个参数字符才算命中；粘性正则从块尾开始匹配，只扫描其后的空白。
+const EVAL_ARGUMENT_FOLLOWS = /[ \t]+[^\s;&|()<>#]/y;
+// 还原值里 eval 之后已有空白时，块之后只需（可选空白加）一个参数字符。
+const EVAL_ARGUMENT_AFTER_SPACE = /[ \t]*[^\s;&|()<>#]/y;
+// 不算 eval 参数的字符：换行等空白、运算符与注释符。
+const EVAL_ARGUMENT_BREAK = /[\s;&|()<>#]/;
 
 /**
- * 正则兜底放行所需的只读取证命令：只读取或打印、从不把参数当命令执行的程序。是否带写盘/执行类选项
+ * (a) 兜底放行所需的只读取证命令：只读取或打印、从不把参数当命令执行的程序。是否带写盘/执行类选项
  * （rg --pre、find -delete、git --ext-diff）沿用只读 allowlist 的选项表，git 只认只读子命令。
+ * W-SEC1 起路径写法（/usr/bin/sudo）也算 (a) 命中，HEAD 上本是放行的只读查看会被新命中误拦，所以并入一组
+ * 只处理路径字符串或读取文件内容、没有任何执行程序类选项的工具：路径工具（readlink、realpath、basename、
+ * dirname）、存在性测试（test、[）、体积（du）、校验和与比较（md5、md5sum、shasum、sha*sum、cksum、cmp）与
+ * strings。ldd（Linux 上会运行目标程序）、otool/nm/codesign/xattr（会写或平台专有）、sed/awk（能执行内容）、
+ * diff/lsof/pgrep 不在其中，路径写法出现在它们的参数里仍按无法确认拒绝。
  */
 const EVIDENCE_COMMAND_BINS = new Set([
   'rg',
@@ -1100,6 +1178,22 @@ const EVIDENCE_COMMAND_BINS = new Set([
   'type',
   'file',
   'stat',
+  'readlink',
+  'realpath',
+  'basename',
+  'dirname',
+  'test',
+  '[',
+  'du',
+  'md5',
+  'md5sum',
+  'shasum',
+  'sha1sum',
+  'sha256sum',
+  'sha512sum',
+  'cksum',
+  'cmp',
+  'strings',
 ]);
 
 /**
@@ -1117,34 +1211,262 @@ function isEvidenceInvocation(bin: string, args: readonly ShellWord[]): boolean 
   return findDeniedOption(bin, values) === null && checkReadonlySubcommand(bin, values).safe;
 }
 
+/**
+ * 只查手册页的 man（W-SEC1）：'man shutdown'、'man 8 reboot'、'man -k sudo' 里的命中词只是页名或检索词。
+ * man 不进 EVIDENCE_COMMAND_BINS：man-db 会把 xargs 追加的运行时项当成选项（-P 分页器），所以它不算惰性的
+ * 管道消费者，也不享受 xargs 目标的取证豁免，只在 (a) 的归属判定里放行。放行要求：没有执行/写盘类选项
+ * （MAN_OPTION_TABLE），且每个操作数都是普通页名或章节号（字母数字与 . _ : + @ -）——macOS 的 man 脚本会把
+ * 含 '/' 的页面路径交给 eval（路径里的 $(...) 会执行），man-db 会格式化任意文件。
+ */
+const MAN_PAGE_OPERAND = /^[\w.:+@-]+$/;
+
+function isManualPageLookup(bin: string, args: readonly ShellWord[]): boolean {
+  if (bin !== 'man') {
+    return false;
+  }
+  const values = args.map((word) => word.value);
+  return (
+    findDeniedOption(bin, values) === null &&
+    values.every((value) => value.startsWith('-') || MAN_PAGE_OPERAND.test(value))
+  );
+}
+
+/**
+ * 写法种类，只用于诊断：记录命中是怎么写出来的，不记录原文（审计侧只保存命令哈希）。顺序固定，便于比对。
+ */
+type SpellingKind =
+  | 'path-qualified'
+  | 'backslash-escaped'
+  | 'line-continuation'
+  | 'quoted'
+  | 'ansi-c-quoted'
+  | 'escaped-separator'
+  | 'letter-case'
+  | 'name-family-variant';
+
+const SPELLING_KIND_ORDER: readonly SpellingKind[] = [
+  'path-qualified',
+  'backslash-escaped',
+  'line-continuation',
+  'quoted',
+  'ansi-c-quoted',
+  // 名字与别的文本由被转义（或 ANSI-C 解码出）的空白/运算符连在同一个词里：'id\;sudo'、'sudo\ -i'。
+  'escaped-separator',
+  'letter-case',
+  'name-family-variant',
+];
+
+/**
+ * 补全写法种类：value 是（已去引号的）命令名文本，canonical 是规范名。kinds 里已有的种类（(a) 还原原始文本时
+ * 记下的转义、续行、引号、ANSI-C）保留。返回按固定顺序排列的种类，规范写法返回空数组。
+ */
+function describeSpelling(
+  value: string,
+  canonical: string,
+  kinds: Set<SpellingKind> = new Set()
+): SpellingKind[] {
+  if (value.includes('/')) {
+    kinds.add('path-qualified');
+  }
+  if (value.includes('\\')) {
+    kinds.add('backslash-escaped');
+  }
+  if (/['"]/.test(value)) {
+    kinds.add('quoted');
+  }
+  const base = path.basename(value.replace(STRIPPED_NAME_CHARS, ''));
+  if (base !== base.toLowerCase()) {
+    kinds.add('letter-case');
+  }
+  if (base.toLowerCase() !== canonical) {
+    kinds.add('name-family-variant');
+  }
+  return SPELLING_KIND_ORDER.filter((kind) => kinds.has(kind));
+}
+
+function formatSpelling(kinds: readonly SpellingKind[]): string {
+  return kinds.length > 0 ? kinds.join('+') : 'plain';
+}
+
 interface DeniedNameHit {
+  /** 规范名（sudo、dd、mkfs、eval…），诊断只记录它，不记录原始写法。 */
   name: string;
-  /** 名字在命令串里的起点。 */
+  /**
+   * 命中块在命令串里的起点（跳过前导续行），落在词法器切出的某个词的区间里；同一块切出的多片命中共用它。
+   */
   index: number;
   block: TerminalSafetyBlock;
+  /** 写法种类（path-qualified、backslash-escaped…），只用于诊断。 */
+  spelling: SpellingKind[];
 }
 
 function findDeniedNameHits(command: string): DeniedNameHit[] {
   const hits: DeniedNameHit[] = [];
-  for (const match of command.matchAll(DENIED_NAME_PATTERN)) {
-    // 第 1 组是 DENIED_BINS，第 2 组是带参数的 eval；两组互斥。
-    const group = match[1] === undefined ? 2 : 1;
-    const index = match.indices?.[group]?.[0];
-    const name = match[group];
-    if (index === undefined || name === undefined) {
+  let chunkStart = -1;
+  for (let index = 0; index <= command.length; index++) {
+    const char = command[index];
+    if (char === '\\' && index + 1 < command.length) {
+      // 反斜杠连同其后一个字符（含换行，即续行）属于同一块：'\ '、'\;' 在 shell 里不切词。
+      // 被转义的分隔符在还原后再切片（collectChunkHits），不会因为留在块里而漏掉其后的名字。
+      if (chunkStart < 0) {
+        chunkStart = index;
+      }
+      index++;
       continue;
     }
-    hits.push({ name: normalizeBinName(name), index, block: deniedNameBlock(name) });
+    if (char === undefined || RAW_CHUNK_BREAK.test(char)) {
+      if (chunkStart >= 0) {
+        collectChunkHits(command, chunkStart, index, hits);
+        chunkStart = -1;
+      }
+      continue;
+    }
+    if (chunkStart < 0) {
+      chunkStart = index;
+    }
   }
   return hits;
 }
 
-function deniedNameBlock(name: string): TerminalSafetyBlock {
-  const bin = normalizeBinName(name);
+/**
+ * 把一个原始文本块还原后再按空白与 shell 运算符切片，逐片规范化并与 DENIED_BINS/eval 比较，命中记入 hits
+ * （W-SEC1 返工）。还原值里出现空白或运算符，只可能来自被转义的分隔符（'id\;sudo'、'sudo\ -i'、'x\&\&reboot'）
+ * 或 $'...' 解码出的分隔符（$'id\x3bsudo'）：外层 shell 把它们当成同一个词，但这个词交给 sh -c、ssh、su -c
+ * 这类会再切词的宿主时分隔符重新生效，其后的名字就在命令位置上。整块按一个名字比较会漏掉它们——HEAD 的词边界
+ * 正则只看名字前一个字符（'\;sudo' 里 ';' 算边界）反而能拦住，所以必须切片。
+ * 一块里的全部命中都记在块起点上（跳过前导续行），findWordAt 把它映射回承载它的词，归属判定不变；同一块里的
+ * 同名命中只记一次（归属结果相同），所以命中数不超过块数乘规范名数，整条命令仍是线性。
+ */
+function collectChunkHits(
+  command: string,
+  start: number,
+  end: number,
+  hits: DeniedNameHit[]
+): void {
+  const decoded = decodeRawChunk(command.slice(start, end));
+  const { value } = decoded;
+  // 词法器把续行当作词间空白：'\<换行>sudo' 的词从 s 开始，命中起点也要跳过前导续行才能映射回词。
+  let index = start;
+  while (command[index] === '\\' && command[index + 1] === '\n') {
+    index += 2;
+  }
+  const seen = new Set<string>();
+  let pieceStart = -1;
+  for (let offset = 0; offset <= value.length; offset++) {
+    const char = value[offset];
+    if (char !== undefined && !RAW_CHUNK_BREAK.test(char)) {
+      if (pieceStart < 0) {
+        pieceStart = offset;
+      }
+      continue;
+    }
+    if (pieceStart < 0) {
+      continue;
+    }
+    const piece = value.slice(pieceStart, offset);
+    // 片不是整个还原值：名字与别的文本由被转义（或 ANSI-C 解码出）的分隔符连在同一个词里。
+    const joined = pieceStart > 0 || offset < value.length;
+    pieceStart = -1;
+    const name = normalizeBinName(piece);
+    if (seen.has(name)) {
+      continue;
+    }
+    if (
+      !DENIED_BINS.has(name) &&
+      !(name === 'eval' && evalArgumentFollows(value, offset, command, end))
+    ) {
+      continue;
+    }
+    seen.add(name);
+    const kinds = new Set(decoded.kinds);
+    if (joined) {
+      kinds.add('escaped-separator');
+    }
+    hits.push({
+      name,
+      index,
+      block: deniedNameBlock(name),
+      spelling: describeSpelling(piece, name, kinds),
+    });
+  }
+}
+
+/**
+ * eval 只在其后（同一行）还跟着参数时才算命中（L4-P8 之前的口径）。片在还原值中间时看还原值里其后的文本；
+ * 其后只剩空白或什么都没有（片在块尾，'eval\ '）时接着看原始文本里块之后的文本，与 HEAD 的
+ * 'id\;eval ls' 口径一致。扫描的都是片后与块后的空白段，各段互不重叠，整条命令仍是线性。
+ */
+function evalArgumentFollows(
+  value: string,
+  pieceEnd: number,
+  command: string,
+  chunkEnd: number
+): boolean {
+  let offset = pieceEnd;
+  while (value[offset] === ' ' || value[offset] === '\t') {
+    offset++;
+  }
+  if (offset < value.length) {
+    return offset > pieceEnd && !EVAL_ARGUMENT_BREAK.test(value[offset]);
+  }
+  // 还原值里片后已有空白时，块之后的空白可有可无；否则块之后至少要有一个空白。
+  const follows = offset > pieceEnd ? EVAL_ARGUMENT_AFTER_SPACE : EVAL_ARGUMENT_FOLLOWS;
+  follows.lastIndex = chunkEnd;
+  return follows.test(command);
+}
+
+/**
+ * 原始文本块的宽松去引号读法（只服务 (a) 兜底，不是 shell 的精确语义）：删去单双引号、转义反斜杠与续行，
+ * 解码 $'...'（未闭合时解码到块尾），$"..." 去掉 '$'。宽松是有意的：引号内的反斜杠在本 shell 里是字面量，
+ * 但这段文本经 ssh、su -c 这类再切词的程序转交时就是转义；多命中只会让归属判定多确认一次。
+ */
+function decodeRawChunk(raw: string): { value: string; kinds: Set<SpellingKind> } {
+  const kinds = new Set<SpellingKind>();
+  let value = '';
+  for (let index = 0; index < raw.length; index++) {
+    const char = raw[index];
+    const next = raw[index + 1];
+    if (char === '\\' && next !== undefined) {
+      index++;
+      if (next === '\n') {
+        kinds.add('line-continuation');
+      } else {
+        kinds.add('backslash-escaped');
+        value += next;
+      }
+      continue;
+    }
+    if (char === '$' && next === "'") {
+      // 块在 $'...' 内部的空白处被切开时没有闭引号：补一个闭引号解码到块尾。
+      const decoded = decodeAnsiCQuote(raw, index + 2) ?? decodeAnsiCQuote(`${raw}'`, index + 2);
+      if (decoded) {
+        kinds.add('ansi-c-quoted');
+        value += decoded.value;
+        index = decoded.end;
+        continue;
+      }
+    }
+    if (char === '$' && next === '"') {
+      // $"..." 是本地化字符串，'$' 不出现在词值里；引号在下一轮删去。
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      kinds.add('quoted');
+      continue;
+    }
+    value += char;
+  }
+  return { value, kinds };
+}
+
+/** 提权类被禁程序：(a) 命中时按提权规则报告。 */
+const PRIVILEGE_ESCALATION_BINS = new Set(['sudo', 'su', 'doas', 'pkexec', 'run0']);
+
+function deniedNameBlock(bin: string): TerminalSafetyBlock {
   if (bin === 'eval') {
     return { rule: 'shell-eval', reason: 'eval is blocked in terminal.exec' };
   }
-  if (bin === 'sudo' || bin === 'su') {
+  if (PRIVILEGE_ESCALATION_BINS.has(bin)) {
     return {
       rule: 'shell-privilege-escalation',
       reason: 'Privilege escalation commands are blocked in terminal.exec',
@@ -1200,15 +1522,17 @@ function checkDeniedNameFallback(
     for (const context of contexts) {
       const blocker = explainHit(hit, context, depth, evidenceBins);
       if (blocker) {
-        // 只记录被禁程序名与归类原因，不记录命令文本。
+        // 只记录规范名、写法种类（路径、转义、引号、名字族变体等）与归类原因，不记录命令文本或原始写法。
         logSafetyDecision(
-          `denied-name fallback matched ${hit.name} but ${blocker}; failing closed`
+          `denied-name fallback matched ${hit.name} (${formatSpelling(hit.spelling)}) but ${blocker}; failing closed`
         );
         return { safe: false, block: hit.block };
       }
     }
   }
-  const names = [...new Set(hits.map((hit) => hit.name))].join(', ');
+  const names = [
+    ...new Set(hits.map((hit) => `${hit.name} (${formatSpelling(hit.spelling)})`)),
+  ].join(', ');
   const bins = [...evidenceBins].map(truncateForReason).join(', ');
   const detail = bins
     ? `arguments of read-only evidence commands (${bins}) or other inert positions`
@@ -1681,12 +2005,13 @@ function attributeCandidate(
       }
     }
   }
-  const entry: WordAttribution = isEvidenceInvocation(bin, own)
-    ? { bins: [bin] }
-    : {
-        blocker: `it is an argument of ${truncateForReason(bin)}, which is not a read-only evidence command in this form`,
-        bins: [],
-      };
+  const entry: WordAttribution =
+    isEvidenceInvocation(bin, own) || isManualPageLookup(bin, own)
+      ? { bins: [bin] }
+      : {
+          blocker: `it is an argument of ${truncateForReason(bin)}, which is not a read-only evidence command in this form`,
+          bins: [],
+        };
   for (const word of own) {
     set(word, entry);
   }
@@ -1815,6 +2140,14 @@ function inspectResolvedCommand(
   }
   const bin = normalizeBinName(head.value);
   if (DENIED_BINS.has(bin)) {
+    const spelling = describeSpelling(head.value, bin);
+    if (spelling.length > 0) {
+      // 路径写法、残留引号/反斜杠、大小写或名字族变体（sudo-rs、sudo.ws）经规范化识别（W-SEC1）：
+      // 只记录规范名与写法种类，不记录原始写法。
+      logSafetyDecision(
+        `command-position denied bin ${bin} recognized from a ${formatSpelling(spelling)} spelling; blocking`
+      );
+    }
     return readonlyBlock('shell-denied-bin', `Blocked executable in terminal.exec: ${bin}`);
   }
   if (bin === 'eval') {
@@ -2253,17 +2586,65 @@ const GNU_PREFIXED_ALIASES = new Map([
   ['gfind', 'find'],
 ]);
 
+// 命令名里删去的字符：引号与反斜杠。词法器已按 shell 规则去引号，残留的只来自引号内的字面反斜杠/引号
+// （"\sudo"）或 (a) 的宽松还原；shell 直接执行时那是另一个（几乎不存在的）程序名，但经 ssh、su -c 这类会再切词的
+// 程序转交时就是 sudo，所以从严当作同名程序（W-SEC1）。
+const STRIPPED_NAME_CHARS = /[\\'"]/g;
+
 /**
- * 命令名规范化：取 basename（/usr/bin/sudo）、小写（macOS 默认大小写不敏感的文件系统上 RM 就是 rm）、
- * 折叠 GNU g 前缀别名，mkfs.ext4 等 mkfs.<fstype> 变体归为 mkfs。
+ * 命令名规范化（(a) 与 (b) 共用，W-SEC1 起同步覆盖路径与转义写法）：删去残留的引号与反斜杠，取 basename
+ * （任意目录前缀：/usr/bin/sudo、../bin/sudo、HEAD:docs/sudo）、小写（macOS 默认大小写不敏感的文件系统上
+ * RM 就是 rm）、折叠 GNU g 前缀别名，mkfs.ext4 等 mkfs.<fstype> 变体归为 mkfs，提权程序名族（sudo-rs、
+ * sudo.ws、sudoedit、su-rs …）归为根名（见 privilegeFamilyRoot）。
  */
 function normalizeBinName(raw: string): string {
-  const base = path.basename(raw).toLowerCase();
+  const base = path.basename(raw.replace(STRIPPED_NAME_CHARS, '')).toLowerCase();
   const alias = GNU_PREFIXED_ALIASES.get(base);
   if (alias) {
     return alias;
   }
-  return base.startsWith('mkfs.') ? 'mkfs' : base;
+  if (base.startsWith('mkfs.')) {
+    return 'mkfs';
+  }
+  return privilegeFamilyRoot(base) ?? base;
+}
+
+/*
+ * 提权程序名族（W-SEC1 判定口径）
+ *
+ * 根名：sudo、su、doas、pkexec、run0（都在 DENIED_BINS 里），以及 sudoedit（sudo -e 的另一个入口，归为 sudo）。
+ * 族成员：根名本身，或根名后接一个或多个“'-' 或 '.' + 字母数字”的实现后缀段，例如 sudo-rs、sudo.ws
+ * （Ubuntu 25.10 起原版 sudo 改叫 sudo.ws、sudo-rs 成为默认）、su-rs、su-exec、sudo-rs.real。后缀不逐个枚举，
+ * 发行版新的改名同样命中。
+ * 例外：最后一段是常见的源码、文档、数据、归档扩展名或手册章节号（sudo.md、sudo.rs、sudo.test.ts、su.1、
+ * sudo.8.gz）时它是文件名而不是程序名，不算族成员——这类词常出现在 sed -n、npm test 等非取证命令的参数里。
+ * 下划线不是后缀分隔（sudo_logsrvd 是日志服务，不是提权入口）。破坏类程序（dd、shutdown、killall 等）不做族
+ * 扩展：dd-trace 这类常见包名会被误拦；mkfs.<fstype> 另有专门规则。
+ */
+const PRIVILEGE_FAMILY_ROOTS = new Map([
+  ['sudo', 'sudo'],
+  ['sudoedit', 'sudo'],
+  ['su', 'su'],
+  ['doas', 'doas'],
+  ['pkexec', 'pkexec'],
+  ['run0', 'run0'],
+]);
+const PRIVILEGE_FAMILY_VARIANT = /^([a-z0-9]+)(?:[-.][a-z0-9]+)+$/;
+const NON_PROGRAM_EXTENSION =
+  /\.(?:[1-9]|md|mdx|markdown|txt|text|rst|adoc|org|tex|pdf|html?|xml|json[c5]?|ya?ml|toml|ini|cfg|conf|log|csv|tsv|lock|snap|patch|diff|[cm]?[jt]sx?|py|rb|go|rs|java|kts?|scala|swift|c|h|cc|cpp|cxx|hpp|hh|cs|php|pl|pm|lua|sh|bash|zsh|fish|ps1|bat|cmd|vim|el|sql|proto|graphql|css|scss|less|svg|png|jpe?g|gif|webp|ico|zip|tar|gz|tgz|bz2|xz|zst)$/;
+
+/** base 是已小写的 basename；属于提权程序名族时返回根名，否则返回 null。 */
+function privilegeFamilyRoot(base: string): string | null {
+  const exact = PRIVILEGE_FAMILY_ROOTS.get(base);
+  if (exact) {
+    return exact;
+  }
+  const match = PRIVILEGE_FAMILY_VARIANT.exec(base);
+  const root = match ? PRIVILEGE_FAMILY_ROOTS.get(match[1]) : undefined;
+  if (!root || NON_PROGRAM_EXTENSION.test(base)) {
+    return null;
+  }
+  return root;
 }
 
 // 赋值前缀（A=1、A+=1、A[0]=1）不是命令，真正的命令在其后。
