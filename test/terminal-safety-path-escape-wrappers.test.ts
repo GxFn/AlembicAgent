@@ -10,7 +10,9 @@
  * 2. 拼写模糊（大小写、引号、转义位置、续行、ANSI-C 引号、名字族变体）一律拦截；
  * 3. 只读查看与取证写法（含路径写法与转义写法的取证参数）仍然放行；
  * 4. 新增拦截分支的诊断只含规范化名字与写法种类，不含命令原文；
- * 5. 接近 MAX_TERMINAL_COMMAND_LENGTH 的命令检查成本仍与长度成线性。
+ * 5. 接近 MAX_TERMINAL_COMMAND_LENGTH 的命令检查成本仍与长度成线性；
+ * 6. 提权名字族只认显式清单里的提权程序（W-SEC1r1）：'npm run su-check' 这类脚本名、目标名放行，清单内程序的
+ *    各种写法照旧拦截。
  */
 import Logger from '@alembic/core/logging';
 import { describe, expect, it, vi } from 'vitest';
@@ -537,5 +539,148 @@ describe('terminal.exec blacklist: path, escape and unknown-wrapper spellings of
     const large = timeOf(1_200);
     // 线性时 4 倍输入约 4 倍耗时，二次方约 16 倍；留出噪声余量，只拦截明显的超线性增长。
     expect(large).toBeLessThan(Math.max(small * 10, 40));
+  });
+});
+
+describe('terminal.exec blacklist: privilege family is an explicit list of known programs (W-SEC1r1)', () => {
+  /*
+   * W-SEC1r1（2026-10-26 总控判定）：fb8686c 的名字族规则把“根名 + 任意 '-'/'.' 字母数字后缀”都归入提权族，
+   * 'npm run su-check' 这类脚本名、目标名由放行变成拦截。提权名字族收窄为显式清单，只认确有其物的提权程序；
+   * 清单内程序的大小写、路径、转义、引号写法照旧识别，其余口径（转义空白连起来的被禁名、man 只读查询）不变。
+   */
+  it.each([
+    'npm run su-check',
+    'npm run sudo-lint',
+    'make su-test',
+    'pnpm su-x',
+    'yarn sudo.check',
+    'npm run doas-config',
+    'make pkexec-policy',
+    'npm run run0-test',
+    'make sudoedit-docs',
+    'npm run su-rs-bench',
+    'caffeinate npm run su-check',
+    'npx turbo run sudo-lint --filter web',
+  ])('allows the script or target name %s that merely starts like a privilege program', (command) => {
+    expect(checkTerminalCommandSafety(command), command).toEqual({ safe: true });
+  });
+
+  // 清单内的全部提权程序：命令位置由 (b) 拦截（shell-denied-bin），未知 wrapper 之下由 (a) 拦截
+  // （shell-privilege-escalation）。
+  const KNOWN_PRIVILEGE_PROGRAMS = [
+    'sudo',
+    'sudoedit',
+    'sudo-rs',
+    'sudoedit-rs',
+    'sudo.ws',
+    'su',
+    'su-rs',
+    'su-exec',
+    'doas',
+    'pkexec',
+    'run0',
+  ] as const;
+
+  const PROGRAM_SPELLINGS: ReadonlyArray<readonly [string, (name: string) => string]> = [
+    ['plain', (name) => name],
+    ['upper case', (name) => name.toUpperCase()],
+    ['absolute path', (name) => `/usr/bin/${name}`],
+    ['cargo path', (name) => `/usr/lib/cargo/bin/${name}`],
+    ['leading backslash', (name) => `\\${name}`],
+    ['inner backslash', (name) => `${name[0]}\\${name.slice(1)}`],
+    ['quoted', (name) => `"${name}"`],
+    ['inner quotes', (name) => `${name[0]}''${name.slice(1)}`],
+  ];
+
+  it.each(
+    KNOWN_PRIVILEGE_PROGRAMS
+  )('keeps blocking every spelling of the known program %s', (name) => {
+    const missed: string[] = [];
+    for (const [kind, spell] of PROGRAM_SPELLINGS) {
+      const spelled = spell(name);
+      const cases: Array<readonly [string, string]> = [
+        [`${spelled} whoami`, DENIED],
+        [`timeout 5 ${spelled} whoami`, DENIED],
+        [`caffeinate ${spelled} whoami`, PRIV],
+        [`flock /tmp/l ${spelled} whoami`, PRIV],
+      ];
+      for (const [command, rule] of cases) {
+        const actual = blockedRule(command);
+        if (actual !== rule) {
+          missed.push(`${kind}: ${command} => ${actual ?? 'safe'} (expected ${rule})`);
+        }
+      }
+    }
+    expect(missed).toEqual([]);
+  });
+
+  it.each([
+    // 审计列出的绕过写法与 fb8686c 的名字族用例：收窄后全部照旧拦截。
+    { command: 'caffeinate /usr/bin/sudo -i', rule: PRIV },
+    { command: 'caffeinate \\sudo -i', rule: PRIV },
+    { command: 'arch -arm64 /usr/bin/sudo -i', rule: PRIV },
+    { command: 'flock /tmp/l /bin/dd if=/dev/zero of=/dev/disk2', rule: DESTRUCTIVE },
+    { command: 'strace /sbin/reboot', rule: DESTRUCTIVE },
+    { command: 'doas /usr/bin/passwd', rule: DENIED },
+    { command: 'unshare /sbin/mkfs.ext4 /dev/sda1', rule: DESTRUCTIVE },
+    { command: 'sudo-rs whoami', rule: DENIED },
+    { command: 'sudo.ws whoami', rule: DENIED },
+    { command: 'doas whoami', rule: DENIED },
+    { command: 'SUDO.WS whoami', rule: DENIED },
+    { command: 'su-exec nobody id', rule: DENIED },
+    { command: 'caffeinate su-exec nobody id', rule: PRIV },
+    // 清单内程序的转义、ANSI-C 与转义分隔符写法。
+    { command: 'caffeinate sudo\\.ws -i', rule: PRIV },
+    { command: 'caffeinate su-ex\\ec nobody id', rule: PRIV },
+    { command: "caffeinate 'sudo'-rs -i", rule: PRIV },
+    { command: "caffeinate $'\\x73udo-rs' -i", rule: PRIV },
+    { command: 'caffeinate sh -c id\\;sudo-rs\\ -i', rule: PRIV },
+    { command: 'ssh host sudoedit-rs\\ /etc/hosts', rule: PRIV },
+    // fb8686c 的转义空白口径不变：转义空白连起来的被禁名在非取证命令的参数里照常拦截。
+    { command: 'npm test -- my\\ su\\ test', rule: PRIV },
+    { command: 'git commit -m "fix sudo\\; handling"', rule: PRIV },
+    { command: 'git commit -m "fix sudo handling"', rule: PRIV },
+  ])('keeps blocking $command after narrowing the privilege family', ({ command, rule }) => {
+    expect(blockedRule(command), command).toBe(rule);
+  });
+
+  it.each([
+    // man 的只读手册页查询照旧放行；文件名与取证参数照旧放行。
+    'man sudo',
+    'man 8 sudo',
+    'man -k sudo',
+    'man su-rs',
+    'npm run lint:su-check',
+    'ls docs/sudo.md',
+    'wc -l docs/sudo-rs.md',
+    'which sudo-rs doas pkexec run0',
+  ])('still allows %s after narrowing the privilege family', (command) => {
+    expect(checkTerminalCommandSafety(command), command).toEqual({ safe: true });
+  });
+
+  it('logs a lookalike release with the family root only, never the word or the command text', () => {
+    const debug = vi.spyOn(Logger.getInstance(), 'debug').mockImplementation(() => undefined);
+    try {
+      const commands = ['npm run su-check', 'make sudo-lint'];
+      for (const command of commands) {
+        expect(checkTerminalCommandSafety(command), command).toEqual({ safe: true });
+      }
+      const messages = debug.mock.calls.map((call) => String(call[0]));
+      expect(messages).toContainEqual(
+        expect.stringMatching(/su-family lookalike that is not a known privilege program/)
+      );
+      expect(messages).toContainEqual(
+        expect.stringMatching(/sudo-family lookalike that is not a known privilege program/)
+      );
+      for (const message of messages) {
+        for (const command of commands) {
+          expect(message).not.toContain(command);
+        }
+        expect(message).not.toContain('su-check');
+        expect(message).not.toContain('sudo-lint');
+      }
+    } finally {
+      debug.mockRestore();
+    }
   });
 });

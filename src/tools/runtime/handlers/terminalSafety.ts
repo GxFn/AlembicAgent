@@ -7,7 +7,8 @@
  *    (a) 不依赖词法器的兜底：把每一层命令串的原始文本按空白、; & | ( ) < > 与反引号切成块（反斜杠连同其后
  *        一个字符不切开，续行同样不切开），每块按宽松的去引号读法还原（删去引号与转义反斜杠、解码 $'...'），
  *        还原值再按空白、换行与上述运算符切片，逐片按命令名规范化（取最后一个 '/' 之后的名字、小写、GNU g 前缀、
- *        mkfs.<fstype>、提权程序名族）后与 DENIED_BINS/eval 比较（W-SEC1）。所以路径写法（/usr/bin/sudo、
+ *        mkfs.<fstype>、提权程序名族的显式清单）后与 DENIED_BINS/eval 比较（W-SEC1；W-SEC1r1 起名字族不按后缀
+ *        泛化，'npm run su-check' 不算命中）。所以路径写法（/usr/bin/sudo、
  *        ../bin/sudo）、转义写法（\sudo、s\udo、su\<换行>do）、引号拼接（s''udo、"/sbin/"reboot）、ANSI-C 引号
  *        （$'\x73udo'）、名字族变体（sudo-rs、sudo.ws）以及被转义的分隔符连起来的名字（'sh -c id\;sudo'、
  *        'ssh host sudo\ reboot'、$'id\x3bsudo'：交给 sh -c、ssh 再切词时分隔符重新生效）都命中。命中后只有
@@ -44,8 +45,9 @@ import Logger from '@alembic/core/logging';
 import { observeSafely } from '#shared/observers.js';
 
 /**
- * 被禁程序的规范名。提权类（sudo、su、doas、pkexec、run0）另按名字族识别（sudo-rs、sudo.ws、sudoedit 等，
- * 判定口径见 privilegeFamilyRoot）；mkfs 覆盖 mkfs.<fstype>。命令名先经 normalizeBinName 规范化再比较。
+ * 被禁程序的规范名。提权类（sudo、su、doas、pkexec、run0）另按名字族的显式清单识别（sudo-rs、sudo.ws、
+ * sudoedit 等确有其物的提权程序，见 PRIVILEGE_FAMILY_ROOTS；W-SEC1r1 起不按任意后缀泛化）；mkfs 覆盖
+ * mkfs.<fstype>。命令名先经 normalizeBinName 规范化再比较。
  */
 export const DENIED_BINS = new Set([
   'sudo',
@@ -1122,7 +1124,8 @@ function lexShellReadings(command: string): ShellReading[] | { block: TerminalSa
  *    被转义的分隔符（'id\;sudo'、'sudo\ -i'、'true\&\&dd'）与 $'...' 解码出的分隔符（$'id\x3bsudo'）在外层
  *    shell 里不切词，但这个词交给 sh -c、ssh、su -c 这类会再切词的宿主时就重新生效。
  * 4. 规范化（normalizeBinName）：逐片取最后一个 '/' 之后的名字（任意目录前缀）、小写、GNU g 前缀、mkfs.<fstype>、
- *    提权程序名族（sudo-rs、sudo.ws 等，见 privilegeFamilyRoot），再与 DENIED_BINS 比较。eval 沿用 L4-P8 之前
+ *    提权程序名族（sudo-rs、sudo.ws 等显式清单，见 privilegeFamilyRoot），再与 DENIED_BINS 比较；形似名字族但不在
+ *    清单里的词（su-check、sudo-lint）不算命中，只记一条放行诊断（W-SEC1r1）。eval 沿用 L4-P8 之前
  *    的口径，只在其后还跟着参数时才算命中（单独的 eval 什么也不执行，'npm run eval' 不该被拦）；片在还原值中间时
  *    看还原值里其后的文本，片在块尾时看原始文本里块之后的文本（evalArgumentFollows）。
  * '=sudo'、'--pre=sudo' 这类名字前没有 '/' 的粘连写法、'sudoers' 这类更长的单词、'sudo.md' 这类文件名不算命中。
@@ -1375,6 +1378,15 @@ function collectChunkHits(
       !DENIED_BINS.has(name) &&
       !(name === 'eval' && evalArgumentFollows(value, offset, command, end))
     ) {
+      const lookalike = privilegeFamilyLookalikeRoot(name);
+      if (lookalike) {
+        // 形似提权程序名族、但不在显式清单里（su-check、sudo-lint 这类脚本名或目标名）：不算命中，放行这一片
+        // （W-SEC1r1）。只记它像哪个根名，不记原词与命令原文；同一块里同名只记一次。
+        seen.add(name);
+        logSafetyDecision(
+          `denied-name fallback saw a ${lookalike}-family lookalike that is not a known privilege program; not treating it as a denied bin`
+        );
+      }
       continue;
     }
     seen.add(name);
@@ -2594,8 +2606,8 @@ const STRIPPED_NAME_CHARS = /[\\'"]/g;
 /**
  * 命令名规范化（(a) 与 (b) 共用，W-SEC1 起同步覆盖路径与转义写法）：删去残留的引号与反斜杠，取 basename
  * （任意目录前缀：/usr/bin/sudo、../bin/sudo、HEAD:docs/sudo）、小写（macOS 默认大小写不敏感的文件系统上
- * RM 就是 rm）、折叠 GNU g 前缀别名，mkfs.ext4 等 mkfs.<fstype> 变体归为 mkfs，提权程序名族（sudo-rs、
- * sudo.ws、sudoedit、su-rs …）归为根名（见 privilegeFamilyRoot）。
+ * RM 就是 rm）、折叠 GNU g 前缀别名，mkfs.ext4 等 mkfs.<fstype> 变体归为 mkfs，显式清单里的提权程序（sudo-rs、
+ * sudo.ws、sudoedit、su-rs …）归为根名（见 privilegeFamilyRoot；W-SEC1r1 起不按后缀泛化）。
  */
 function normalizeBinName(raw: string): string {
   const base = path.basename(raw.replace(STRIPPED_NAME_CHARS, '')).toLowerCase();
@@ -2610,41 +2622,65 @@ function normalizeBinName(raw: string): string {
 }
 
 /*
- * 提权程序名族（W-SEC1 判定口径）
+ * 提权程序名族（W-SEC1 引入；W-SEC1r1 收窄为显式清单）
  *
- * 根名：sudo、su、doas、pkexec、run0（都在 DENIED_BINS 里），以及 sudoedit（sudo -e 的另一个入口，归为 sudo）。
- * 族成员：根名本身，或根名后接一个或多个“'-' 或 '.' + 字母数字”的实现后缀段，例如 sudo-rs、sudo.ws
- * （Ubuntu 25.10 起原版 sudo 改叫 sudo.ws、sudo-rs 成为默认）、su-rs、su-exec、sudo-rs.real。后缀不逐个枚举，
- * 发行版新的改名同样命中。
- * 例外：最后一段是常见的源码、文档、数据、归档扩展名或手册章节号（sudo.md、sudo.rs、sudo.test.ts、su.1、
- * sudo.8.gz）时它是文件名而不是程序名，不算族成员——这类词常出现在 sed -n、npm test 等非取证命令的参数里。
- * 下划线不是后缀分隔（sudo_logsrvd 是日志服务，不是提权入口）。破坏类程序（dd、shutdown、killall 等）不做族
- * 扩展：dd-trace 这类常见包名会被误拦；mkfs.<fstype> 另有专门规则。
+ * 族成员只认下表列出、确有其物的提权程序，按（已小写的）basename 精确比较后归为 DENIED_BINS 里的根名；
+ * 大小写、目录前缀、残留引号与反斜杠由 normalizeBinName 先行规整，所以 /usr/bin/SUDO-RS、\sudo.ws、
+ * s''u-rs 照旧识别。W-SEC1 曾把“根名 + 任意 '-'/'.' 字母数字后缀”都归入提权族，'npm run su-check'、
+ * 'make sudo-lint' 这类脚本名、目标名因此被误拦；现在不再按后缀泛化，新出现的提权程序改名要逐个补进下表，
+ * 并在旁边写明它是什么程序。fb8686c 注释里举过的 sudo-rs.real 查不到出处（没有发行版或上游以此名安装），
+ * 不列入。下划线写法（sudo_logsrvd 是日志服务）与破坏类程序（dd-trace 这类常见包名）同样不做族扩展；
+ * mkfs.<fstype> 另有专门规则。
  */
 const PRIVILEGE_FAMILY_ROOTS = new Map([
+  // sudo：通用提权程序（sudo.ws 项目的原版 C 实现）。
   ['sudo', 'sudo'],
+  // sudoedit：sudo -e 的另一个入口（原版 sudo 安装的同一程序），以目标用户身份编辑文件。
   ['sudoedit', 'sudo'],
+  // sudo-rs：Trifecta Tech 基金会的 Rust 版 sudo；Ubuntu 25.10 起成为默认 sudo（/usr/bin/sudo-rs），
+  // Arch、Fedora、Debian 的 sudo-rs 包也以此名安装。
+  ['sudo-rs', 'sudo'],
+  // sudoedit-rs：sudo-rs 的 sudoedit（Arch 的 sudo-rs 包与 FreeBSD 的 sudo-rs-coexist 包以此名安装）。
+  ['sudoedit-rs', 'sudo'],
+  // sudo.ws：Ubuntu 25.10 起原版 C sudo 改用的名字（/usr/bin/sudo.ws，经 update-alternatives 切换回去）。
+  ['sudo.ws', 'sudo'],
+  // su：切换用户身份执行 shell 或命令的程序（util-linux、shadow 实现）。
   ['su', 'su'],
+  // su-rs：sudo-rs 包附带的 Rust 版 su（util-linux su 的重新实现；Arch、Fedora、Debian/Ubuntu 以此名安装）。
+  ['su-rs', 'su'],
+  // su-exec：Alpine 的 su-exec 包（上游 ncopa/su-exec），切换用户与组 id 后 exec 目标程序，容器入口脚本里
+  // 常用作 gosu 的替代；以 root 运行时可换成任意身份执行命令。
+  ['su-exec', 'su'],
+  // doas：OpenBSD 的提权程序，Linux 上有 OpenDoas 移植。
   ['doas', 'doas'],
+  // pkexec：polkit 的提权执行程序，以另一用户（默认 root）身份执行命令。
   ['pkexec', 'pkexec'],
+  // run0：systemd 256 起附带的提权程序（经 polkit 授权、以另一用户身份执行命令）。
   ['run0', 'run0'],
 ]);
-const PRIVILEGE_FAMILY_VARIANT = /^([a-z0-9]+)(?:[-.][a-z0-9]+)+$/;
-const NON_PROGRAM_EXTENSION =
-  /\.(?:[1-9]|md|mdx|markdown|txt|text|rst|adoc|org|tex|pdf|html?|xml|json[c5]?|ya?ml|toml|ini|cfg|conf|log|csv|tsv|lock|snap|patch|diff|[cm]?[jt]sx?|py|rb|go|rs|java|kts?|scala|swift|c|h|cc|cpp|cxx|hpp|hh|cs|php|pl|pm|lua|sh|bash|zsh|fish|ps1|bat|cmd|vim|el|sql|proto|graphql|css|scss|less|svg|png|jpe?g|gif|webp|ico|zip|tar|gz|tgz|bz2|xz|zst)$/;
 
-/** base 是已小写的 basename；属于提权程序名族时返回根名，否则返回 null。 */
+/**
+ * 只用于诊断：名字形如“根名 + '-'/'.' + 字母数字”、但不在 PRIVILEGE_FAMILY_ROOTS 清单里（su-check、sudo-lint、
+ * sudo.md）。这正是 W-SEC1 曾泛化归族、W-SEC1r1 起不再拦截的那类词，命中时记一条放行诊断。sudoedit 写在 sudo
+ * 前面，让 'sudoedit-x' 报 sudo 族时取到最长的根名。
+ */
+const PRIVILEGE_FAMILY_LOOKALIKE = /^(sudoedit|sudo|su|doas|pkexec|run0)[-.][a-z0-9]/;
+
+/** base 是已小写的 basename；是清单里的提权程序时返回根名，否则返回 null（不按后缀泛化，W-SEC1r1）。 */
 function privilegeFamilyRoot(base: string): string | null {
-  const exact = PRIVILEGE_FAMILY_ROOTS.get(base);
-  if (exact) {
-    return exact;
-  }
-  const match = PRIVILEGE_FAMILY_VARIANT.exec(base);
-  const root = match ? PRIVILEGE_FAMILY_ROOTS.get(match[1]) : undefined;
-  if (!root || NON_PROGRAM_EXTENSION.test(base)) {
+  return PRIVILEGE_FAMILY_ROOTS.get(base) ?? null;
+}
+
+/**
+ * name 是 normalizeBinName 的结果且不是被禁名：形似提权程序名族但不在清单里时返回它像的根名（只给诊断用），
+ * 否则返回 null。
+ */
+function privilegeFamilyLookalikeRoot(name: string): string | null {
+  const match = PRIVILEGE_FAMILY_LOOKALIKE.exec(name);
+  if (!match) {
     return null;
   }
-  return root;
+  return PRIVILEGE_FAMILY_ROOTS.get(match[1]) ?? null;
 }
 
 // 赋值前缀（A=1、A+=1、A[0]=1）不是命令，真正的命令在其后。

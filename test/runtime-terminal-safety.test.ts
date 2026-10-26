@@ -3252,6 +3252,9 @@ describe('terminal.exec dangerous-command blacklist audit follow-up (L4-P8c)', (
     'cat ./docs/sudo',
     'rg -n sudoers src',
     'npm run lint:su-check',
+    // W-SEC1r1：提权名字族只认显式清单里的程序，以 su-/sudo 开头的脚本名、目标名不算命中。
+    'npm run su-check',
+    'make sudo-lint',
     'ls ./dd.txt',
     // (3) 普通 '&>' 用法。
     'ls &>/dev/null',
