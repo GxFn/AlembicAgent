@@ -130,7 +130,7 @@ const REFLECTIONS = [
 
 describe('EpisodicConsolidator empty-candidate guard (C26)', () => {
   it('retains the previous bootstrap generation and reports clearSkipped when zero candidates are extracted', () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     const f = makeSemanticMemory();
     const { logger, lines } = makeLogger();
     try {
@@ -154,7 +154,7 @@ describe('EpisodicConsolidator empty-candidate guard (C26)', () => {
   });
 
   it('surfaces the skip warning through info when the host logger has no warn channel', () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     const f = makeSemanticMemory();
     const infoLines: string[] = [];
     try {
@@ -174,7 +174,7 @@ describe('EpisodicConsolidator empty-candidate guard (C26)', () => {
   });
 
   it('still replaces the previous generation inside the transaction when at least one candidate exists', () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     const f = makeSemanticMemory();
     const { logger, lines } = makeLogger();
     try {
@@ -209,7 +209,7 @@ describe('EpisodicConsolidator empty-candidate guard (C26)', () => {
   });
 
   it('runs compact outside the transaction and never requests replacement when clearPrevious is false', () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     const f = makeSemanticMemory();
     const { logger, lines } = makeLogger();
     try {
@@ -236,7 +236,7 @@ describe('EpisodicConsolidator logger isolation on the new log paths', () => {
   // vitest 会把 unhandled rejection 计为运行错误（即使断言全部通过），因此本用例同时锁定
   // "异步 logger 的 rejection 由 observeSafely 兜底" 这一不变量。
   it('isolates async warn and info rejections on the skip path and still returns the receipt', async () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     const f = makeSemanticMemory();
     try {
       const result = new EpisodicConsolidator(f.memory, {
@@ -255,7 +255,7 @@ describe('EpisodicConsolidator logger isolation on the new log paths', () => {
   });
 
   it('isolates a synchronously throwing warn sink on the skip path', () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     const f = makeSemanticMemory();
     try {
       const result = new EpisodicConsolidator(f.memory, {
@@ -321,7 +321,7 @@ describe('EpisodicConsolidator extraction ports (C33 / C35)', () => {
   });
 
   it('extracts analysisText facts and insights with the low regex confidence importance', () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     const f = makeSemanticMemory();
     const { logger } = makeLogger();
     try {

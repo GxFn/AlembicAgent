@@ -3,12 +3,17 @@
  * 合成维度集合以 Core 公开的 SYNTHESIS_DIM_IDS 为单源：这里把一个夹具 id 并入该集合，
  * 断言新增的合成维度同样会 seed 兄弟台账，而普通维度不会。打开日志只陈述台账事实
  * （job、维度、条目数），不再声称 submit schema 变体已生效。
+ * openLoopEvidence 必须收到调用方持有的原文摘要表（sourceDigests），本文件按生产形状传入一张表，
+ * 并断言摘要写进的正是这张表。
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { EvidenceLedgerStore } from '../src/agent/evidence/EvidenceLedgerStore.js';
+import {
+  EvidenceLedgerStore,
+  EvidenceSourceDigestTable,
+} from '../src/agent/evidence/EvidenceLedgerStore.js';
 import { openLoopEvidence } from '../src/agent/evidence/loopLedger.js';
 
 // vi.mock 工厂会被提升到模块顶部执行，夹具 id 必须经 vi.hoisted 声明，不能引用普通常量。
@@ -48,14 +53,18 @@ function open(dimensionId: string) {
   seedSibling(dataRoot, jobId);
   const info = vi.fn();
   const warn = vi.fn();
+  const sourceDigests = new EvidenceSourceDigestTable();
   const store = openLoopEvidence({
     dataRoot,
     defaultJobId: 'runtime-fallback-job',
     sessionId: 'synthesis-session',
     sharedState: { _bootstrapSessionId: jobId, _dimensionMeta: { id: dimensionId } },
     logger: { info, warn },
+    // openLoopEvidence 要求调用方传入原文摘要表（RED-P2b）：生产中由 AgentRuntime 实例持有并跨 reactLoop
+    // 共享。这里每次打开传一张新表，与生产“调用方持有”的形状一致，不走 store 自建的实例级表。
+    sourceDigests,
   });
-  return { store, info, warn, jobId };
+  return { store, info, warn, jobId, sourceDigests };
 }
 
 describe('openLoopEvidence synthesis dimension ids', () => {
@@ -74,6 +83,30 @@ describe('openLoopEvidence synthesis dimension ids', () => {
 
     expect(store?.stats().entries).toBe(0);
     expect(info).not.toHaveBeenCalledWith(expect.stringContaining('synthesis seeded'));
+  });
+
+  it('records source digests into the caller-provided runtime table', () => {
+    const { store, sourceDigests } = open('ordinary-dimension');
+    expect(store).not.toBeNull();
+    if (!store) {
+      return;
+    }
+
+    const entry = store.append({
+      tool: 'code.read',
+      callId: 'range-read',
+      file: 'src/a.ts',
+      range: { start: 1, end: 2 },
+      content: 'line one\nline two',
+    });
+
+    // 摘要写进调用方（AgentRuntime 实例）持有的表，而不是 store 自建的实例级表。
+    expect(sourceDigests.lookup(store.filePath, entry.id)).toMatchObject({
+      callId: 'range-read',
+      file: 'src/a.ts',
+      start: 1,
+      end: 2,
+    });
   });
 
   it('logs the opened ledger facts without claiming the submit schema variant is active', () => {

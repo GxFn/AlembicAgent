@@ -10,7 +10,7 @@
 - `knowledgeManagement` 按方法声明 `update/reject/score/validate` 支持情况；未提供的方法明确失败。
 - 发布/准入继续使用 Core `RecipeProductionPort`，复核使用 Core `StagingManager`，进化使用 Core `ProposalGateway`，不合并生命周期语义。
 - 宿主应将可信用户绑定在 adapter closure 中，再调用 Core 受控服务；不要把 raw repository 的 `update` 作为普通管理入口。
-- `knowledgeRepo` 保留兼容。仅对应的新字段为 `undefined` 时才使用旧字段；显式端口缺方法、失败或取消都不回落旧仓储。
+- `knowledgeRepo` 只在 detail 与 manage 两处保留兼容：仅对应的新字段（`knowledgeRead` / `knowledgeManagement`）为 `undefined` 时才使用旧字段，detail 走这条回落时记 info 日志；显式端口缺方法、失败或取消都不回落旧仓储。prime 已不接受 `knowledgeRepo`（W1-05）：只注入 `knowledgeRepo` 的宿主调用 prime 时返回 `KNOWLEDGE_READ_PORT_UNAVAILABLE` 并记 warn，不调用旧仓储，也不退回 search-only。
 
 Main 的实际装配位于 `lib/tools/ToolContextFactory.ts`，`KnowledgeServiceAdapter.ts` 委托 Core `KnowledgeService.get/update/reject` 并转换 DTO。当前 Main 没有绑定 `score/validate`，调用会明确返回能力不可用；它们不会被伪装为成功。
 

@@ -64,7 +64,7 @@
     {
       "name": "timerRegistry",
       "home": "@alembic/core/events",
-      "agentUsage": "SessionStore owns its cleanup interval and clears it on dispose; checkpoint restoration reuses the receiving instance instead of creating an extra timer."
+      "agentUsage": "No consumer under src/ (rechecked 2026-10-23 against 1d03823): TemporaryToolRegistry retired earlier, SessionStore stopped registering any timer when its read-only tool cache and cleanupIntervalMs/ttlMs keys were removed in W1-04, and its checkpoint file chain was removed in W2a-10."
     }
   ],
   "lintExemptions": [

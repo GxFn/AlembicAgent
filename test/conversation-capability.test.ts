@@ -16,8 +16,8 @@ import { Conversation } from '../src/tools/runtime/toolsets/Conversation.js';
  * 背景：Conversation 曾在构造时接收一个 builder 级的记忆协调器，并调用
  * buildPromptInjection / cacheToolResult。真实的 MemoryCoordinator 没有这两个方法，
  * 前者的 TypeError 被空 catch 吞掉，后者被可选调用跳过——这条路径接上也不会工作。
- * 记忆注入与工具观察缓存由运行循环按本次运行的协调器负责（buildDynamicMemoryPrompt /
- * recordObservation）；能力层再持有一个跨运行共享的协调器还会让不同会话串记忆。
+ * 记忆注入由运行循环按本次运行的协调器负责（buildDynamicMemoryPrompt）；旧的工具观察缓存
+ * recordObservation 已随缓存层删除（W1-04）。能力层再持有一个跨运行共享的协调器还会让不同会话串记忆。
  */
 
 /** 记录对协调器的全部属性访问，暴露「调用了真实合同里不存在的方法」这类静默失败。 */

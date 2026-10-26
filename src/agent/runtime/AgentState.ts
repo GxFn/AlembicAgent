@@ -200,9 +200,10 @@ export class AgentState extends EventEmitter {
   /**
    * 导出为可序列化对象。
    *
-   * 返回 data/history 的浅拷贝（与 data/history getter 一致）：AgentRuntime 把它写进 result.state，
-   * 旧实现直接返回内部引用，execute 返回后状态机上的任何转移（例如通配 abort/error）都会把记录
-   * 追加进已返回结果的 history，调用方改动快照也会写穿内部状态（I40）。
+   * 返回 data/history 的浅拷贝（与 data/history getter 一致）。W1-06 起 AgentRuntime 不再持有本类实例，
+   * result.state 改由它私有的 #phaseSnapshot() 生成（只含 phase）；本方法只服务直接使用 AgentState 的调用方。
+   * 旧实现直接返回内部引用：快照返回后状态机上的任何转移（例如通配 abort/error）都会把记录追加进
+   * 已返回快照的 history，调用方改动快照也会写穿内部状态（I40）。
    * 浅拷贝已足够：send() 每次 push 新条目并以新对象替换 #data，从不原地修改已有条目或 data 对象。
    */
   toJSON() {

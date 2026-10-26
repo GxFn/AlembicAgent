@@ -1198,7 +1198,7 @@ describe('bounded Analyst memory assembly', () => {
     }
   });
   it('budgets real session and persistent memory without duplicating reflections', async () => {
-    const session = new SessionStore({ cleanupIntervalMs: 0 });
+    const session = new SessionStore();
     session.addTierReflection(0, {
       tierIndex: 0,
       completedDimensions: ['before'],
@@ -2961,7 +2961,7 @@ describe('Analyst session memory keeps cross-dimension advice within the budget 
 
   /** 真实 SessionStore：每个前序维度 5 条带证据的中文发现、6 个已读文件与一段 digest 摘要。 */
   function seededSession(dimCount: number, reflection: Partial<TierReflectionInput> = {}) {
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     for (let i = 0; i < dimCount; i++) {
       const dimId = `dim-${i}`;
       store.storeDimensionReport(dimId, {

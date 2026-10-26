@@ -3,8 +3,9 @@
  *
  * 场景：宿主显式传入比策略超时更长的 execution.timeoutMs，阶段 budgetOverride 的超时（600s）
  * 远大于 BudgetPolicy.timeoutMs（50ms）。修复前策略超时只能在 P5 经 validateDuring 命中，
- * 被归为 policy_stop + needsSummary：不记 cancelReason/timedOutStages，finalize 还会再发一次
- * 强制摘要，宿主把它判为正常完成。修复后有效超时取两者较小正值，命中 stage_timeout 分支。
+ * 被归为 policy_stop（当时信号还带 needsSummary）：不记 cancelReason/timedOutStages，finalize 还会
+ * 再发一次强制摘要，宿主把它判为正常完成。修复后有效超时取两者较小正值，命中 stage_timeout 分支。
+ * ExitSignal.needsSummary 已随 W2a-07（L5-P09）删除，是否发强制摘要只由 AgentRuntime.#finalize 决定。
  */
 import { describe, expect, it, vi } from 'vitest';
 import { BudgetPolicy, PolicyEngine } from '../src/agent/policies/index.js';

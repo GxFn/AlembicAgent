@@ -45,7 +45,21 @@ interface SessionStoreCacheStats {
   fileCacheSize: number;
 }
 
-/** 随只读工具缓存删除而失效的构造参数键；传入时只记 debug 日志，不再有任何效果。 */
+/**
+ * 随只读工具缓存删除（W1-04）而失效的构造参数键；传入时每次构造只记一条 debug 日志，不再有任何效果。
+ *
+ * 兼容分支登记（工作区“临时兼容代码须写明消费者、原因、删除条件、清理触发与负责人”）：
+ * 消费者：经 SessionStoreConfig 的索引签名（或 JS）仍传 ttlMs / cleanupIntervalMs 的旧调用方。
+ *   2026-10-23 复核：宿主 Alembic 的 RuntimeInitializer.createBootstrapSessionStore 不传这两个键，
+ *   Plugin、Dashboard 没有构造点；仓内只有专门验证“旧键被忽略”的测试仍传入。
+ * 原因：缓存删除前这两个键会注册清理定时器。索引签名会静默收下任何键，若不留痕迹，旧调用方看不出
+ *   键已失效，所以只记一条 debug 指出被忽略的键（不注册定时器、不进入 projectContext）。
+ * 删除条件：工作区扫描确认没有调用方再传这两个键，且 SessionStoreConfig 的索引签名已收窄、旧键在
+ *   编译期即被拒绝；届时删除本常量、构造函数里的检测分支与对应测试。
+ * 清理触发：SessionStoreConfig 公开构造选项收窄的那一次改动（与 getStats().cache 的删除同属
+ *   SessionStore 公开形状收窄，见 RETIRED_TOOL_CACHE_STATS）。
+ * 负责人：AlembicAgent 窗口。
+ */
 const RETIRED_CONFIG_KEYS = ['ttlMs', 'cleanupIntervalMs'] as const;
 
 /**
@@ -208,8 +222,8 @@ export class SessionStore implements Disposable {
     });
     this.#logger = Logger.getInstance();
 
-    // 旧调用方仍可能经索引签名传入已删除的缓存键：不注册定时器、不进入 projectContext，
-    // 只留一条 debug 日志说明被忽略的键与原因，便于定位尚未迁移的调用点。
+    // 旧调用方仍可能经索引签名传入已删除的缓存键（兼容登记见 RETIRED_CONFIG_KEYS）：不注册定时器、
+    // 不进入 projectContext，只留一条 debug 日志说明被忽略的键与原因，便于定位尚未迁移的调用点。
     const retiredKeys = RETIRED_CONFIG_KEYS.filter((key) => config[key] !== undefined);
     if (retiredKeys.length > 0) {
       this.#log(

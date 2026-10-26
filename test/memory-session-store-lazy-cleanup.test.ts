@@ -14,7 +14,8 @@
 import v8 from 'node:v8';
 import vm from 'node:vm';
 import { timerRegistry } from '@alembic/core/events';
-import { describe, expect, it } from 'vitest';
+import Logger from '@alembic/core/logging';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryCoordinator } from '../src/agent/memory/MemoryCoordinator.js';
 import { SessionStore } from '../src/agent/memory/SessionStore.js';
 
@@ -50,6 +51,10 @@ async function forceGc(rounds = 6): Promise<void> {
 }
 
 describe('SessionStore lifecycle without the cleanup timer', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('registers no global cleanup interval under default construction (host shape and fromJSON)', () => {
     const before = cleanupTimerCount();
     const stores = [
@@ -84,6 +89,45 @@ describe('SessionStore lifecycle without the cleanup timer', () => {
       }
     }
     expect(cleanupTimerCount()).toBe(before);
+  });
+
+  it('logs exactly one debug line per construction that passes retired keys, and none otherwise', () => {
+    const logger = Logger.getInstance();
+    const debug = vi.spyOn(logger, 'debug').mockImplementation(() => undefined);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const retiredKeyLines = () =>
+      debug.mock.calls
+        .map((call) => String(call[0]))
+        .filter((message) => message.includes('ignored retired config key'));
+
+    const plain = new SessionStore(hostShapedConfig);
+    try {
+      // 不带旧键：兼容分支不触发，不记任何旧键日志。
+      expect(retiredKeyLines()).toEqual([]);
+    } finally {
+      plain.dispose();
+    }
+
+    const legacy = new SessionStore({ ...hostShapedConfig, ttlMs: 1_000, cleanupIntervalMs: 20 });
+    try {
+      // 两个旧键合并为一条 debug，写明被忽略的键与原因；不升级为 info/warn。
+      const lines = retiredKeyLines();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('ignored retired config key(s) ttlMs, cleanupIntervalMs');
+      expect(lines[0]).toContain('no timer registered');
+      expect(info.mock.calls.flat().join('\n')).not.toContain('retired config key');
+      expect(warn.mock.calls.flat().join('\n')).not.toContain('retired config key');
+      // 旧键不进入快照的 projectContext。
+      expect(legacy.toJSON().projectContext).not.toHaveProperty('ttlMs');
+      expect(legacy.toJSON().projectContext).not.toHaveProperty('cleanupIntervalMs');
+    } finally {
+      legacy.dispose();
+    }
+
+    new SessionStore({ cleanupIntervalMs: 0 }).dispose();
+    // 显式传 0 也算传入旧键（值不影响判定）：每次构造恰好一条。
+    expect(retiredKeyLines()).toHaveLength(2);
   });
 
   it('reports the fixed all-zero cache stats, also after fromJSON and dispose', () => {

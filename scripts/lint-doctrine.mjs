@@ -5,7 +5,8 @@
 //
 //  A. module-scope mutable `let` bindings, EXCEPT null-initialized lazy
 //     slots (`let _x: T | null = null` — the blessed lazy-singleton idiom
-//     used by ModelRegistry and LLMGateway);
+//     used by ModelRegistry; LLMGateway's module-level slot was removed in
+//     W2a-11, each AiProvider now owns its own gateway);
 //  B. module-scope EMPTY `new Map()` / `new Set()` accumulators (literal-
 //     seeded const lookups are immutable and unmatched by construction).
 //

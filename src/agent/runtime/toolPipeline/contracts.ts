@@ -14,19 +14,12 @@ export interface ToolCall {
  * 仅暴露工具执行实际使用的 Runtime 端口，避免中间件依赖整个执行循环。
  * W2a-02 起不再 Pick dataRoot / fileCache（runtimeBridge 不再把它们投影进宿主请求）与
  * toolRegistry（管道没有读取方：duplicateCache 的复用准入改读运行时 TOOL_REGISTRY 声明）。
+ * W-CL1 起也不再 Pick emitProgress / bus：可选的 progressEmitter、eventBusPublisher 中间件随 W2a-01 删除后，
+ * 管道里没有任何读取方；工具事件只由 Runtime 自身路径发送。本类型不在运行时导出面上，签名快照计数不变。
  */
 export type ToolRuntimePort = Pick<
   AgentRuntime,
-  | 'id'
-  | 'presetName'
-  | 'projectRoot'
-  | 'lang'
-  | 'logger'
-  | 'aiProvider'
-  | 'policies'
-  | 'toolRouter'
-  | 'emitProgress'
-  | 'bus'
+  'id' | 'presetName' | 'projectRoot' | 'lang' | 'logger' | 'aiProvider' | 'policies' | 'toolRouter'
 >;
 export type ToolLoopPort = Partial<Pick<LoopContext, 'resourceScope' | 'toolSchemas'>> &
   Pick<

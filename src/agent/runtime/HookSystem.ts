@@ -347,7 +347,7 @@ function attachHookDiagnosticToProcessEvent(
  * Pipeline middleware (allowlistGate and the other gates, evidenceCapture,
  * trackerSignal, traceRecord, submitDedup) remain in ToolExecutionPipeline
  * because they need synchronous access to tool results and loop state.
- * 默认装配顺序以 createToolPipeline 为准；observationRecord 已移出默认装配（L5-P47 / I45）。
+ * 默认装配顺序以 createToolPipeline 为准；旧 observationRecord 先移出默认装配（L5-P47 / I45），实现与导出已随 W1-04 删除。
  */
 export function registerDefaultHooks(
   hookSystem: HookSystem,

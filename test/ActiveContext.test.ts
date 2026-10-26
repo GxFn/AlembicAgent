@@ -828,7 +828,7 @@ describe('working memory ownership and read budgets', () => {
 
   it('logs and empties a session context built with a NaN host budget instead of throwing', () => {
     const warn = vi.spyOn(Logger.getInstance(), 'warn').mockImplementation(() => undefined);
-    const store = new SessionStore({ cleanupIntervalMs: 0 });
+    const store = new SessionStore();
     try {
       store.storeDimensionReport('previous', { analysisText: 'prior analysis '.repeat(40) });
       expect(store.buildContextForDimension('next', { tokenBudget: Number.NaN })).toBe('');

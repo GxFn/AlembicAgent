@@ -12,14 +12,22 @@ go through controller-decided waves.
 
 The tables below preserve the 2026-06-12 baseline rather than claim its paths
 and counts are current. The current machine record uses `src/tools/runtime/`
-and `RuntimeCapability`. `TemporaryToolRegistry` has already retired; the
-remaining `timerRegistry` consumer is `SessionStore`, whose checkpoint restore
-reuses its existing instance and cleanup timer. The compressor now shares one
+and `RuntimeCapability`. `TemporaryToolRegistry` has already retired. Since
+W1-04 (2026-10-22) `SessionStore` no longer registers a cleanup timer: its
+read-only tool cache, TTL and the `cleanupIntervalMs`/`ttlMs` keys were removed,
+and W2a-10 removed its checkpoint file chain. No file under `src/` consumes
+`timerRegistry` any more. The compressor now shares one
 lazy initialization Promise between concurrent callers instead of exposing a
 premature `parsersLoaded` flag. Its obsolete lint exemption has been removed.
 The former RuntimeCapability reach-up exception was already resolved by the
 kernel extraction recorded in `config/layer-contract.json` on 2026-06-19;
 the stale standing exception has now been removed from the machine record.
+
+Path refresh (2026-10-23, W-CL1, checked against 1d03823 plus this change): rows that cited
+the former `tools/v2` tree now cite their current `src/tools/runtime/` files,
+the `pathGuard` and `timerRegistry` citations point at current code, and the
+I6 `SessionStore` freeze cites `RETIRED_TOOL_CACHE_STATS`. Every other line
+number below remains the 2026-06-12 baseline.
 
 Current side effects and host responsibilities are described in
 `docs/entrypoint-effects.md`; public singleton compatibility and the existing
@@ -50,19 +58,20 @@ this repo. `Logger` (`@alembic/core/logging`), `pathGuard`
 Core-owned; their disposition belongs to the Core AD4 leg. Agent-side
 consumption facts: Logger reach-through 30 call sites across 28 files (all
 constructor/function-scoped after this leg's I1-I4 remediation); pathGuard 1
-site (`src/agent/context/ConversationStore.ts:25,68`); timerRegistry 2
-consumers, both with paired clear on dispose
-(`src/agent/forge/TemporaryToolRegistry.ts:242,255`,
-`src/agent/memory/SessionStore.ts:200,871`).
+site (import and `assertProjectWriteSafe` call at
+`src/agent/context/ConversationStore.ts:36,104`); timerRegistry had 2
+consumers at the baseline (`TemporaryToolRegistry` and `SessionStore`), both
+with paired clear on dispose. Both are gone now (see the reconciliation
+above), so Agent `src/` has no timerRegistry consumer.
 
 ## 2. Module-scope mutable state
 
 | Id | Item | Site | Disposition |
 | --- | --- | --- | --- |
 | M1 | `proxyDispatcherCache` Map (undici proxy dispatchers) | `src/ai/transport/LLMTransport.ts:28-29` | BLESSED as managed cache — lifecycle policy already implemented: cap `MAX_PROXY_DISPATCHER_CACHE_SIZE = 8`, close/destroy on eviction, null-caching of failed init; rationale documented in-file (socket/keep-alive reuse in the resident daemon). |
-| M2 | `parsers[]` + `parsersLoaded` lazy-init flag | `src/tools/v2/compressor/OutputCompressor.ts:21-22` | BLESSED as lazy-init state — write-once idempotent loader explicitly designed to avoid import-time parser loading. |
+| M2 | `parsers[]` + `parsersLoaded` lazy-init flag (baseline; now one shared `parserLoading` Promise plus `loadedParsers`, see the reconciliation) | `src/tools/runtime/compressor/OutputCompressor.ts:83,88` | BLESSED as lazy-init state — write-once idempotent loader explicitly designed to avoid import-time parser loading. |
 | M3 | `_hookCounter` monotonic id counter | `src/agent/runtime/HookSystem.ts:104` | BLESSED — uniqueness-only counter; all behavioral hook state is instance-scoped (`#hooks`, `#hookErrors`). |
-| M4 | Declarative constant tables: `TOOL_REGISTRY` spec table, `VALID_*`/`IGNORED_DIRS`/`BLOCKED_BINS`/`NON_CACHEABLE*`/`RETRYABLE_NETWORK_CODES` Sets, frozen defaults | `src/tools/v2/registry.ts`, various (census grep 2026-06-12) | HEALTHY per AD0 ("frozen constant Sets are fine") — constant data, never mutated after module init. No action. |
+| M4 | Declarative constant tables: `TOOL_REGISTRY` spec table, `VALID_*`/`IGNORED_DIRS`/`BLOCKED_BINS`/`NON_CACHEABLE*`/`RETRYABLE_NETWORK_CODES` Sets, frozen defaults | `src/tools/runtime/registry.ts`, various (census grep 2026-06-12) | HEALTHY per AD0 ("frozen constant Sets are fine") — constant data, never mutated after module init. No action. |
 
 ## 3. Import-time work
 
@@ -73,7 +82,7 @@ consumers, both with paired clear on dispose
 | I3 | `const logger = Logger.getInstance()` at module scope | `src/agent/prompts/insightGate.ts:26` | REMEDIATED this leg — same lazy accessor conversion. |
 | I4 | `const logger = Logger.getInstance()` at module scope | `src/ai/gateway/LLMGateway.ts:40` | REMEDIATED this leg — same lazy accessor conversion. |
 | I5 | `const STYLE_GUIDE = buildProducerStyleGuide()` | `src/agent/prompts/insightProducer.ts:133` | HEALTHY — pure deterministic string composition over Core constants (verified in `@alembic/core` `domain/knowledge/StyleGuide.ts`); no IO, no env, no mutable capture. Same class as frozen constants. |
-| I6 | `const execAsync = promisify(exec)` and `Object.freeze(...)` defaults | `src/tools/v2/handlers/terminal.ts:19`, `src/agent/memory/SessionStore.ts:45` | HEALTHY — pure wrapper construction. |
+| I6 | `const execAsync = promisify(exec)` and `Object.freeze(...)` defaults (the SessionStore freeze is now `RETIRED_TOOL_CACHE_STATS`) | `src/tools/runtime/handlers/terminal.ts:72`, `src/agent/memory/SessionStore.ts:75` | HEALTHY — pure wrapper construction. |
 
 Constructor-scoped `Logger.getInstance()` acquisitions (e.g.
 `src/agent/runtime/AgentEventBus.ts:55`, memory/context stores) are
@@ -85,10 +94,10 @@ future-wave scope.
 
 | Id | Item | Site | Finding |
 | --- | --- | --- | --- |
-| L1 | `child.stdout.on('data')`, `child.on('close'/'error')` | `src/tools/v2/handlers/code.ts:186,197,217` | HEALTHY — per-spawn listeners scoped to the child process lifetime; no leak surface. |
+| L1 | `child.stdout`/`child.stderr` `.on('data')`, `child.on('close'/'error')` | `src/tools/runtime/handlers/code.ts:666,689,704,727` | HEALTHY — per-spawn listeners scoped to the child process lifetime; no leak surface. |
 | L2 | `registerDefaultHooks` bridges (2 × `hookSystem.on`, `llm:call:before`/`llm:call:after`; the dead exit-hook bridge was removed with the never-dispatched hook events in L5-P41) | `src/agent/runtime/HookSystem.ts:362,375` | HEALTHY — `HookSystem` is per-`AgentRuntime` instance (`src/agent/runtime/AgentRuntime.ts:340`), `on()` returns an unsubscribe, and all hook state dies with the runtime instance; no module-scope HookSystem exists. |
 | L3 | `AgentEventBus` listeners | `src/agent/strategies/pipeline/attempt.ts:83,127` | HEALTHY in-repo — `subscribe()`/`request()` and their subscription and pending-reply maps were removed in L5-P41, so listeners exist only as inherited EventEmitter `on`/`off` registrations; the only Agent-internal site is the pipeline attempt's paired `on`/`off` of `TOOL_CALL_START` (strategies otherwise only publish); `resetInstance()` removes all listeners; host-side subscriptions are host-owned lifecycles. |
-| L4 | timer registrations | `src/agent/forge/TemporaryToolRegistry.ts:255`, `src/agent/memory/SessionStore.ts:200` | HEALTHY — both `timerRegistry.setInterval` sites have paired `timerRegistry.clear` on dispose (`:242`, `:871`). |
+| L4 | timer registrations | none (baseline: `TemporaryToolRegistry` and `SessionStore`) | RETIRED — at the baseline both `timerRegistry.setInterval` sites had a paired `timerRegistry.clear` on dispose; `TemporaryToolRegistry` has since retired and the `SessionStore` interval was removed with its read-only tool cache in W1-04, so no timer registration remains under `src/`. |
 
 Zero missing-disposal sites found; AD4 item (4) is satisfied by this census
 with no code change required.
@@ -98,7 +107,8 @@ with no code change required.
 - SD-4 raw-SQL `semantic_memories` read adapter
   (`src/agent/memory/MemoryStore.ts`) — standing declared exception (AD2
   charter); Option-C end-state trigger is a user register row. Untouched.
-- `CapabilityV2` → `Capability` inheritance reach-up
-  (`src/tools/v2/capabilities/CapabilityV2.ts:9`) — placement-class register
-  item (B5), owned by the layer-contract blessing in
-  `config/layer-contract.json`. Untouched.
+- `CapabilityV2` → `Capability` inheritance reach-up (the class is now
+  `RuntimeCapability`, `src/tools/runtime/toolsets/RuntimeCapability.ts:15`) —
+  placement-class register item (B5). Resolved by the 2026-06-19 kernel
+  extraction recorded in `config/layer-contract.json`; the stale standing
+  exception has been removed from the machine record (see the reconciliation).

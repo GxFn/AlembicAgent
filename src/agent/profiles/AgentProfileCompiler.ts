@@ -325,7 +325,12 @@ const REMOVED_POLICY_SESSION_TOTAL_FIELD = 'maxSessionTokens';
 /**
  * 声明式 budget 策略带会话字段时编译期告警（I03；W2a-07 / L5-P08 按②答复收窄后的口径）。
  *   - maxSessionTokens：已删除。BudgetPolicy 不再读取它（构造器只解构已声明字段），声明了也不会按运行累计
- *     总量停止运行；告警写明“已删除、被忽略”，让仍带旧字段的声明看见这一行为变化。
+ *     总量停止运行；告警写明“已删除、被忽略”，让仍带旧字段的声明看见这一行为变化。告警不再建议改用阶段级
+ *     maxSessionInputTokens：它只是 BudgetController 的阶段内压缩触发，不终止运行（见 BudgetController
+ *     头注释），并不是替代品。告警改为说明已没有按累计 token 终止的上限，并列出现存的真实手段：
+ *     BudgetPolicy 的 maxIterations / timeoutMs（始终生效），以及策略层 maxSessionInputTokens（按整次运行累计
+ *     input 判定，命中走 token_budget_exhausted；只在阶段预算也声明了 maxSessionInputTokens 的循环里生效，
+ *     否则被屏蔽并写 policy_session_limit_bypassed）。
  *   - maxSessionInputTokens：保留（它与屏蔽包装是阶段预算之外唯一的策略层会话配置）。告警只说明口径差异：
  *     它按整次运行累计判定，而 BudgetController 执行的阶段会话预算按阶段内消耗；阶段预算未声明
  *     maxSessionInputTokens 的循环里，其拒绝被屏蔽（运行时写 policy_session_limit_bypassed 诊断）。
@@ -338,8 +343,13 @@ function warnPolicySessionFields(config: Record<string, unknown>) {
   if (removedTotal !== undefined) {
     notes.push(
       `${REMOVED_POLICY_SESSION_TOTAL_FIELD}=${String(removedTotal)} has been removed and is ignored: ` +
-        'BudgetPolicy no longer stops the run on cumulative total tokens; declare a stage budget ' +
-        'maxSessionInputTokens (executed in-stage by BudgetController) instead'
+        'there is no longer any cap that stops the run on cumulative tokens. A stage budget ' +
+        'maxSessionInputTokens is not a replacement: BudgetController uses it only as the in-stage ' +
+        'compaction trigger and does not stop the run on it. To bound a run, use BudgetPolicy ' +
+        'maxIterations or timeoutMs (always enforced), or BudgetPolicy maxSessionInputTokens ' +
+        '(run-level cumulative input; stops the run with token_budget_exhausted only in loops whose ' +
+        'stage budget also declares maxSessionInputTokens, otherwise bypassed with ' +
+        'policy_session_limit_bypassed)'
     );
   }
   if (config.maxSessionInputTokens !== undefined) {

@@ -729,7 +729,10 @@ const EVIDENCE_SPEC: ToolSpec = {
     get: {
       summary: 'Retrieve a captured evidence entry verbatim by id',
       description:
-        'Read back the verbatim content of an evidence-ledger entry cited from [evidence] annotations in tool results. Accepts "E-3" or a sub-range "E-3@start-end": entries with a file range (e.g. E-3=lib/a.ts:200-450) take file line numbers inside that range ("E-3@319-360"); entries without a range take 1-based line numbers within the entry. Lines cut off by the ledger entry cap are not retrievable. Read-only; never touches the file system.',
+        // 模型可见文案（W-CL1）：旧文案称“never touches the file system”，与原文回读不符——code.read 的
+        // range 条目会在项目根内只读一次当前文件判 freshness（见 handlers/evidence.ts 的 resolveVerbatimReadback）。
+        // 这里写明回读条件与返回的 verbatim / redaction / hint 字段，让模型知道何时需要改调 code.read。
+        'Read back an evidence-ledger entry cited from [evidence] annotations in tool results. Accepts "E-3" or a sub-range "E-3@start-end": entries with a file range (e.g. E-3=lib/a.ts:200-450) take file line numbers inside that range ("E-3@319-360"); entries without a range take 1-based line numbers within the entry. Lines cut off by the ledger entry cap are not retrievable. Never writes the ledger or any file. For code.read entries with a file range it reads the current file inside the project root once (never for credential-like files): if the file is unchanged since capture it returns the original text with verbatim: true; otherwise (for example the file changed, is credential-like, lies outside the project root, or cannot be read) it returns the stored ledger content, which may contain redaction markers, with verbatim: false, redaction: {markers, lines} and a hint; call code.read on that file:range when you need verbatim code. Other entries return the stored content without these fields.',
       params: {
         type: 'object',
         properties: {
