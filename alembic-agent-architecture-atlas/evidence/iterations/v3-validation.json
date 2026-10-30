@@ -1,0 +1,119 @@
+{
+  "schemaVersion": 1,
+  "iteration": 3,
+  "checkedAt": "2026-10-22T12:34:35.658Z",
+  "command": "npm run check",
+  "status": "pass",
+  "node": "v24.19.0",
+  "tests": {
+    "parserAndEvidence": 22,
+    "readerLogicAndLoading": 9,
+    "realPilotScenarios": 6,
+    "total": 37
+  },
+  "scopedAgentTests": {
+    "report": "scoped-execution.json",
+    "knowledgeMining": 6,
+    "domainPermissionsAndService": 21,
+    "total": 27,
+    "fullProductSuite": false
+  },
+  "typecheck": "pass",
+  "lint": "pass",
+  "sourceAndAnchors": "pass",
+  "browserRender": {
+    "status": "pass",
+    "diagrams": 76,
+    "receipt": "render/current.json",
+    "latestAttempt": "render/latest-attempt.json"
+  },
+  "build": "pass",
+  "bundleReport": "bundle-report.json",
+  "browserQA": {
+    "schemaVersion": 1,
+    "checkedAt": "2026-10-22T12:34:35.657Z",
+    "checks": [
+      {
+        "name": "76 Mermaid diagrams produced actual nonzero SVGs; latest attempt and receipt match",
+        "result": "pass"
+      },
+      {
+        "name": "Both knowledge sequences are readable in fullscreen with distinct analysis/production labels",
+        "result": "pass"
+      },
+      {
+        "name": "15 exact public entries and source-backed public-entrypoint JSON dialog",
+        "result": "pass"
+      },
+      {
+        "name": "27 actually executed scoped cases shown separately from the six-scenario pilot",
+        "result": "pass"
+      },
+      {
+        "name": "v2 missing new documents and scoped evidence stays explicit; no current fallback",
+        "result": "pass"
+      },
+      {
+        "name": "v3 static build and immutable snapshot retain 76 graphs and 27 scoped passes",
+        "result": "pass"
+      },
+      {
+        "name": "Desktop and narrow domain matrix; table scroll isolated from document width",
+        "result": "pass"
+      }
+    ],
+    "consoleErrorsInBuiltRegression": 0,
+    "screenshots": [
+      "home-v3-1440.png",
+      "knowledge-v3-1440.png",
+      "analysis-sequence-v3-1440.png",
+      "production-sequence-v3-1440.png",
+      "domain-matrix-v3-390.png"
+    ],
+    "narrowViewport": {
+      "requestedWidth": 390,
+      "contentWidth": 375,
+      "scrollWidth": 375,
+      "firstTableWidth": 335,
+      "firstTableScrollWidth": 440,
+      "horizontalPageOverflow": false
+    },
+    "notes": [
+      "Browser default viewport restored and temporary tabs closed after QA.",
+      "A dev-data refresh closed an open evidence dialog during build; navigation was re-observed before continuing.",
+      "Current and snapshot evidence are static samples, not live repository health monitoring."
+    ]
+  },
+  "baselineCommit": "34c62eda7082732e7a6e8bc45fec4e2121c9653e",
+  "sourceInventoryFingerprint": "sha256:5f5cb1df8c5246d21354af46064dcb2ff31522405d313474d75b83652a069236",
+  "documents": 51,
+  "topics": 13,
+  "sourceFiles": 293,
+  "currentSnapshot": "agent-atlas-2026-10-22-v3",
+  "initialJavaScriptBytes": 117586,
+  "currentDataBytes": 2324992,
+  "productFilesCompared": 562,
+  "productFilesChangedDuringContinuation": 0,
+  "historicalSnapshotsPreserved": true,
+  "scopeEvidence": "iterations/v3-scope.json",
+  "changes": [
+    "Added public entry/host and Core consumer boundary guides without importing product runtime or scanning Core internals.",
+    "Added ordinary knowledge production sequence with explicit return projection, separate readiness query and failure boundaries.",
+    "Compared six domain helpers with exact input, permission, outcome and controlled-test boundaries.",
+    "Bound 27 actual Agent test results to fingerprints; stale or failed scoped results block current verification and new snapshots.",
+    "History without scoped evidence remains explicitly unrecorded; duplicate view types use document titles."
+  ],
+  "warnings": [
+    "Mermaid/ELK large chunks are still loaded on demand; build reports chunks larger than 500 kB.",
+    "Current content JSON is about 2.3 MB, separately fetched; bundle size is not measured load time.",
+    "26 unresolved module requests remain explicitly bounded.",
+    "Scripted providers and in-memory gateways do not prove live model quality, production persistence, readiness or publication."
+  ],
+  "notRun": [
+    "whole product test suite",
+    "live AI providers",
+    "production host acceptance",
+    "Core build/test or internal acceptance"
+  ],
+  "noCommitReason": "User authorized independent Agent atlas work; commit, push and publication were not requested."
+}

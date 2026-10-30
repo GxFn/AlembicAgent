@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "title": "AlembicAgent · 架构图谱",
+  "topics": [
+    {
+      "id": "01",
+      "slug": "01-overall-architecture",
+      "title": "总体边界与公开入口",
+      "question": "Agent、Core与宿主各自拥有哪一层事实？"
+    },
+    {
+      "id": "02",
+      "slug": "02-service-orchestration",
+      "title": "服务装配与编排",
+      "question": "Profile怎样成为一次真实运行？"
+    },
+    {
+      "id": "03",
+      "slug": "03-runtime-lifecycle",
+      "title": "循环、预算与取消",
+      "question": "工具回合怎样结束，停止后留下什么？"
+    },
+    {
+      "id": "04",
+      "slug": "04-ai-protocols",
+      "title": "AI与原生协议",
+      "question": "模型请求、重试与原生续接如何保持？"
+    },
+    {
+      "id": "05",
+      "slug": "05-tool-contracts",
+      "title": "工具契约与目录",
+      "question": "模型看到的schema怎样对应执行权限？"
+    },
+    {
+      "id": "06",
+      "slug": "06-tool-execution",
+      "title": "工具执行与安全",
+      "question": "从调用参数到文件或沙箱，边界在哪里？"
+    },
+    {
+      "id": "07",
+      "slug": "07-memory-context",
+      "title": "记忆、上下文与提示",
+      "question": "哪些信息被召回、压缩或持久化？"
+    },
+    {
+      "id": "08",
+      "slug": "08-evidence-knowledge",
+      "title": "证据与知识提交",
+      "question": "E-n怎样成为可复核的知识来源？"
+    },
+    {
+      "id": "09",
+      "slug": "09-domain-runs",
+      "title": "领域任务",
+      "question": "六类run如何复用内核并解释结果？"
+    },
+    {
+      "id": "10",
+      "slug": "10-strict-production",
+      "title": "严格生产与评审",
+      "question": "认知、封印与Core裁决分别由谁完成？"
+    },
+    {
+      "id": "11",
+      "slug": "11-observability",
+      "title": "事件、诊断与脱敏",
+      "question": "观察副本如何与业务原值分离？"
+    },
+    {
+      "id": "12",
+      "slug": "12-build-contracts",
+      "title": "构建、边界与发布",
+      "question": "源码、公开包和宿主消费如何验证？"
+    },
+    {
+      "id": "13",
+      "slug": "13-end-to-end",
+      "title": "一次请求到工具回执",
+      "question": "沿一条真实调用链，从输入走到结果。"
+    }
+  ],
+  "scan": {
+    "sourceRoots": [
+      "src",
+      "scripts"
+    ],
+    "testRoots": [
+      "test"
+    ],
+    "supportPaths": [
+      "config",
+      "docs",
+      "package.json",
+      "package-lock.json",
+      "tsconfig.json",
+      ".github/workflows/ci.yml"
+    ]
+  },
+  "maintenanceBaseline": "agent-atlas-2026-10-22-v4"
+}

@@ -1,0 +1,1643 @@
+{
+  "schemaVersion": 1,
+  "assessmentDate": "2026-10-23",
+  "timezone": "America/Los_Angeles",
+  "status": "assessment-only; roadmap proposed, implementation not started",
+  "sourceSampledAt": "2026-10-23T12:05:20.715Z",
+  "currentCommit": "37bdc7f7b6dc6e0fcc12b95de1dfa5251848b0b0",
+  "currentInventoryFingerprint": "sha256:9804f78d4d358851196c3807db8410acc956ade26b2ac74bcb1674b0110f2514",
+  "sourceBaseline": "Current working tree including pre-existing uncommitted modifications",
+  "frozenBaseline": {
+    "snapshot": "agent-atlas-2026-10-22-v4",
+    "commit": "34c62eda7082732e7a6e8bc45fec4e2121c9653e",
+    "documents": 56,
+    "diagrams": 88,
+    "sourceFiles": 293,
+    "sourceFullReadings": 293,
+    "structuredDeepReadings": 18,
+    "readingSections": 140,
+    "failureEntries": 96,
+    "atlasTests": 37,
+    "recordedAgentExecutions": 267,
+    "meaning": "Historical v4 results only; not current product validation."
+  },
+  "current": {
+    "inventoryFiles": 556,
+    "sourceFiles": 290,
+    "documents": 56,
+    "diagrams": 88,
+    "documentFreshness": {
+      "matched": 3,
+      "stale": 53
+    },
+    "readingByKind": {
+      "support": {
+        "matched": 9,
+        "stale": 11
+      },
+      "tooling": {
+        "matched": 19,
+        "stale": 4
+      },
+      "source": {
+        "stale": 113,
+        "matched": 176,
+        "missing": 1
+      },
+      "test": {
+        "stale": 79,
+        "matched": 132,
+        "missing": 12
+      }
+    },
+    "changedByKind": {
+      "support": 11,
+      "tooling": 4,
+      "source": 113,
+      "test": 79
+    },
+    "addedByKind": {
+      "source": 1,
+      "test": 12
+    },
+    "removedPaths": [
+      "src/agent/strategies/FanOutStrategy.ts",
+      "src/tools/kernel/handler.ts",
+      "src/tools/kernel/routing.ts",
+      "src/tools/runtime/toolsets/System.ts",
+      "test/conversation-store-summarize-budget.test.ts",
+      "test/gate-evaluators-decayed-recipes-alias-diagnostic.test.ts"
+    ],
+    "pilotInputFreshness": "stale",
+    "scopedGroupsByFreshness": {
+      "stale": 46
+    },
+    "scopedExecutionsByFreshness": {
+      "stale": 267
+    },
+    "renderFreshness": "matched",
+    "unresolvedImports": {
+      "non-literal module request; no inferred target": 24,
+      "resolved outside declared inventory": 1,
+      "module resolution failed": 2
+    }
+  },
+  "checks": [
+    {
+      "command": "node scripts/check-atlas.mjs --require-current",
+      "cwd": "alembic-agent-architecture-atlas",
+      "exitCode": 1,
+      "status": "fail",
+      "totalMessages": 861,
+      "meaning": "Source/input freshness and anchor check failed. Includes cascading messages, not this many independent product defects.",
+      "outputDigest": "sha256:39d1671073b7f420cc5e3eff00f79d4801e8ac3eb2917c5e12aff701ab175e61"
+    },
+    {
+      "command": "node scripts/check-render.mjs",
+      "cwd": "alembic-agent-architecture-atlas",
+      "exitCode": 0,
+      "status": "pass",
+      "meaning": "Revalidated existing 88 diagram receipts; did not generate new browser renders.",
+      "receiptCapturedAt": "2026-10-22T13:12:08.614Z"
+    }
+  ],
+  "validatorProbe": {
+    "operation": "In-memory validateScopedExecutionShape with the same v4 case duplicated and passed count adjusted to two",
+    "observedErrors": [],
+    "meaning": "Duplicate-identity validation gap; does not imply stored historical results were fabricated.",
+    "repositoryMutation": false
+  },
+  "topics": [
+    {
+      "id": "01",
+      "title": "总体边界与公开入口",
+      "pages": 5,
+      "diagrams": 6,
+      "depths": {
+        "L2": 3,
+        "L1": 2
+      },
+      "stale": 5
+    },
+    {
+      "id": "02",
+      "title": "服务装配与编排",
+      "pages": 4,
+      "diagrams": 8,
+      "depths": {
+        "L2": 2,
+        "L1": 1,
+        "L3": 1
+      },
+      "stale": 4
+    },
+    {
+      "id": "03",
+      "title": "循环、预算与取消",
+      "pages": 5,
+      "diagrams": 9,
+      "depths": {
+        "L2": 3,
+        "L1": 1,
+        "L3": 1
+      },
+      "stale": 5
+    },
+    {
+      "id": "04",
+      "title": "AI与原生协议",
+      "pages": 3,
+      "diagrams": 6,
+      "depths": {
+        "L2": 2,
+        "L1": 1
+      },
+      "stale": 3
+    },
+    {
+      "id": "05",
+      "title": "工具契约与目录",
+      "pages": 3,
+      "diagrams": 5,
+      "depths": {
+        "L2": 2,
+        "L1": 1
+      },
+      "stale": 3
+    },
+    {
+      "id": "06",
+      "title": "工具执行与安全",
+      "pages": 4,
+      "diagrams": 7,
+      "depths": {
+        "L2": 2,
+        "L1": 1,
+        "L3": 1
+      },
+      "stale": 4
+    },
+    {
+      "id": "07",
+      "title": "记忆、上下文与提示",
+      "pages": 4,
+      "diagrams": 8,
+      "depths": {
+        "L2": 2,
+        "L1": 1,
+        "L3": 1
+      },
+      "stale": 4
+    },
+    {
+      "id": "08",
+      "title": "证据与知识提交",
+      "pages": 4,
+      "diagrams": 6,
+      "depths": {
+        "L2": 2,
+        "L3": 1,
+        "L1": 1
+      },
+      "stale": 4
+    },
+    {
+      "id": "09",
+      "title": "领域任务",
+      "pages": 4,
+      "diagrams": 5,
+      "depths": {
+        "L2": 2,
+        "L1": 1,
+        "L3": 1
+      },
+      "stale": 4
+    },
+    {
+      "id": "10",
+      "title": "严格生产与评审",
+      "pages": 4,
+      "diagrams": 6,
+      "depths": {
+        "L2": 3,
+        "L1": 1
+      },
+      "stale": 3
+    },
+    {
+      "id": "11",
+      "title": "事件、诊断与脱敏",
+      "pages": 4,
+      "diagrams": 8,
+      "depths": {
+        "L2": 2,
+        "L3": 1,
+        "L1": 1
+      },
+      "stale": 4
+    },
+    {
+      "id": "12",
+      "title": "构建、边界与发布",
+      "pages": 3,
+      "diagrams": 4,
+      "depths": {
+        "L2": 2,
+        "L1": 1
+      },
+      "stale": 3
+    },
+    {
+      "id": "13",
+      "title": "一次请求到工具回执",
+      "pages": 6,
+      "diagrams": 10,
+      "depths": {
+        "L4": 5,
+        "L1": 1
+      },
+      "stale": 6
+    }
+  ],
+  "documents": [
+    {
+      "path": "maps/00-diagram-standard.md",
+      "title": "图谱阅读与维护规范",
+      "topic": "00",
+      "depth": "L0",
+      "freshness": "matched",
+      "errorCount": 0
+    },
+    {
+      "path": "maps/01-overall-architecture/call-flow.md",
+      "title": "总体边界与公开入口 · 调用",
+      "topic": "01",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/01-overall-architecture/core-consumption.md",
+      "title": "Agent 的 Core 消费边界",
+      "topic": "01",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/01-overall-architecture/file-dependency.md",
+      "title": "总体边界与公开入口 · 直接依赖",
+      "topic": "01",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/01-overall-architecture/overview.md",
+      "title": "总体边界与公开入口 · 职责",
+      "topic": "01",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/01-overall-architecture/public-api-and-hosts.md",
+      "title": "公开入口与宿主接线",
+      "topic": "01",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/02-service-orchestration/call-flow.md",
+      "title": "服务装配与编排 · 调用",
+      "topic": "02",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 51
+    },
+    {
+      "path": "maps/02-service-orchestration/file-dependency.md",
+      "title": "服务装配与编排 · 直接依赖",
+      "topic": "02",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 2
+    },
+    {
+      "path": "maps/02-service-orchestration/overview.md",
+      "title": "服务装配与编排 · 职责",
+      "topic": "02",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 44
+    },
+    {
+      "path": "maps/02-service-orchestration/stage-failures-and-prompts.md",
+      "title": "阶段失败与提示逐文件深读",
+      "topic": "02",
+      "depth": "L3",
+      "freshness": "stale",
+      "errorCount": 2
+    },
+    {
+      "path": "maps/03-runtime-lifecycle/call-flow.md",
+      "title": "循环、预算与取消 · 调用",
+      "topic": "03",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/03-runtime-lifecycle/file-dependency.md",
+      "title": "循环、预算与取消 · 直接依赖",
+      "topic": "03",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 2
+    },
+    {
+      "path": "maps/03-runtime-lifecycle/overview.md",
+      "title": "循环、预算与取消 · 职责",
+      "topic": "03",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+      "title": "Runtime失败路径逐文件深读",
+      "topic": "03",
+      "depth": "L3",
+      "freshness": "stale",
+      "errorCount": 11
+    },
+    {
+      "path": "maps/03-runtime-lifecycle/state-and-recovery.md",
+      "title": "运行状态、取消与恢复",
+      "topic": "03",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/04-ai-protocols/call-flow.md",
+      "title": "AI与原生协议 · 调用",
+      "topic": "04",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/04-ai-protocols/file-dependency.md",
+      "title": "AI与原生协议 · 直接依赖",
+      "topic": "04",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/04-ai-protocols/overview.md",
+      "title": "AI与原生协议 · 职责",
+      "topic": "04",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/05-tool-contracts/call-flow.md",
+      "title": "工具契约与目录 · 调用",
+      "topic": "05",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/05-tool-contracts/file-dependency.md",
+      "title": "工具契约与目录 · 直接依赖",
+      "topic": "05",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/05-tool-contracts/overview.md",
+      "title": "工具契约与目录 · 职责",
+      "topic": "05",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/06-tool-execution/call-flow.md",
+      "title": "工具执行与安全 · 调用",
+      "topic": "06",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/06-tool-execution/file-dependency.md",
+      "title": "工具执行与安全 · 直接依赖",
+      "topic": "06",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/06-tool-execution/overview.md",
+      "title": "工具执行与安全 · 职责",
+      "topic": "06",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/06-tool-execution/terminal-failures-and-contracts.md",
+      "title": "终端失败与合同逐文件深读",
+      "topic": "06",
+      "depth": "L3",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/07-memory-context/call-flow.md",
+      "title": "记忆、上下文与提示 · 调用",
+      "topic": "07",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/07-memory-context/file-dependency.md",
+      "title": "记忆、上下文与提示 · 直接依赖",
+      "topic": "07",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/07-memory-context/overview.md",
+      "title": "记忆、上下文与提示 · 职责",
+      "topic": "07",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/07-memory-context/source-review-and-recovery.md",
+      "title": "scope与会话恢复逐文件深读",
+      "topic": "07",
+      "depth": "L3",
+      "freshness": "stale",
+      "errorCount": 25
+    },
+    {
+      "path": "maps/08-evidence-knowledge/call-flow.md",
+      "title": "证据与知识提交 · 调用",
+      "topic": "08",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/08-evidence-knowledge/failure-and-receipts.md",
+      "title": "证据提交的失败与回执",
+      "topic": "08",
+      "depth": "L3",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/08-evidence-knowledge/file-dependency.md",
+      "title": "证据与知识提交 · 直接依赖",
+      "topic": "08",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/08-evidence-knowledge/overview.md",
+      "title": "证据与知识提交 · 职责",
+      "topic": "08",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/09-domain-runs/call-flow.md",
+      "title": "领域任务 · 调用",
+      "topic": "09",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/09-domain-runs/file-dependency.md",
+      "title": "领域任务 · 直接依赖",
+      "topic": "09",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/09-domain-runs/overview.md",
+      "title": "领域任务 · 职责",
+      "topic": "09",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/09-domain-runs/result-matrix.md",
+      "title": "六类run的权限与结果",
+      "topic": "09",
+      "depth": "L3",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/10-strict-production/authority-boundaries.md",
+      "title": "Strict 权威与停止边界",
+      "topic": "10",
+      "depth": "L2",
+      "freshness": "matched",
+      "errorCount": 0
+    },
+    {
+      "path": "maps/10-strict-production/call-flow.md",
+      "title": "严格生产与评审 · 调用",
+      "topic": "10",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/10-strict-production/file-dependency.md",
+      "title": "严格生产与评审 · 直接依赖",
+      "topic": "10",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/10-strict-production/overview.md",
+      "title": "严格生产与评审 · 职责",
+      "topic": "10",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/11-observability/call-flow.md",
+      "title": "事件、诊断与脱敏 · 调用",
+      "topic": "11",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 2
+    },
+    {
+      "path": "maps/11-observability/detector-failure-boundaries.md",
+      "title": "凭据检测失败边界逐文件深读",
+      "topic": "11",
+      "depth": "L3",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/11-observability/file-dependency.md",
+      "title": "事件、诊断与脱敏 · 直接依赖",
+      "topic": "11",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/11-observability/overview.md",
+      "title": "事件、诊断与脱敏 · 职责",
+      "topic": "11",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 2
+    },
+    {
+      "path": "maps/12-build-contracts/call-flow.md",
+      "title": "构建、边界与发布 · 调用",
+      "topic": "12",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/12-build-contracts/file-dependency.md",
+      "title": "构建、边界与发布 · 直接依赖",
+      "topic": "12",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/12-build-contracts/overview.md",
+      "title": "构建、边界与发布 · 职责",
+      "topic": "12",
+      "depth": "L2",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/13-end-to-end/call-flow.md",
+      "title": "一次请求到工具回执 · 调用",
+      "topic": "13",
+      "depth": "L4",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/13-end-to-end/complete-sequence.md",
+      "title": "一次请求到工具回执 · 完整时序",
+      "topic": "13",
+      "depth": "L4",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/13-end-to-end/file-dependency.md",
+      "title": "一次请求到工具回执 · 直接依赖",
+      "topic": "13",
+      "depth": "L1",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/13-end-to-end/knowledge-production.md",
+      "title": "分析发现到知识候选回执",
+      "topic": "13",
+      "depth": "L4",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/13-end-to-end/overview.md",
+      "title": "一次请求到工具回执 · 职责",
+      "topic": "13",
+      "depth": "L4",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/13-end-to-end/receipt-and-recovery.md",
+      "title": "回执回程与停止边界",
+      "topic": "13",
+      "depth": "L4",
+      "freshness": "stale",
+      "errorCount": 1
+    },
+    {
+      "path": "maps/file-index.md",
+      "title": "文件阅读索引",
+      "topic": "00",
+      "depth": "L0",
+      "freshness": "stale",
+      "errorCount": 630
+    },
+    {
+      "path": "maps/README.md",
+      "title": "阅读路线",
+      "topic": "00",
+      "depth": "L0",
+      "freshness": "matched",
+      "errorCount": 0
+    }
+  ],
+  "changedPaths": [
+    {
+      "path": "config/agent-public-api-boundary.json",
+      "kind": "support"
+    },
+    {
+      "path": "config/agent-public-api-signatures.json",
+      "kind": "support"
+    },
+    {
+      "path": "config/implicit-keys.json",
+      "kind": "support"
+    },
+    {
+      "path": "config/side-effect-doctrine.json",
+      "kind": "support"
+    },
+    {
+      "path": "docs/execution-lifecycle.md",
+      "kind": "support"
+    },
+    {
+      "path": "docs/llm-adapters.md",
+      "kind": "support"
+    },
+    {
+      "path": "docs/memory-runtime.md",
+      "kind": "support"
+    },
+    {
+      "path": "docs/side-effect-doctrine-census.md",
+      "kind": "support"
+    },
+    {
+      "path": "docs/strict-production.md",
+      "kind": "support"
+    },
+    {
+      "path": "docs/tool-host-integration.md",
+      "kind": "support"
+    },
+    {
+      "path": "docs/tool-pipeline.md",
+      "kind": "support"
+    },
+    {
+      "path": "scripts/eval-mining.mjs",
+      "kind": "tooling"
+    },
+    {
+      "path": "scripts/eval-strict-production.mjs",
+      "kind": "tooling"
+    },
+    {
+      "path": "scripts/lint-doctrine.mjs",
+      "kind": "tooling"
+    },
+    {
+      "path": "scripts/smoke-agent-public-imports.mjs",
+      "kind": "tooling"
+    },
+    {
+      "path": "src/agent/context/ContextWindow.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/context/ConversationStore.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/context/ExplorationTracker.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/context/exploration/ExplorationStrategies.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/context/exploration/PlanTracker.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/context/exploration/SignalDetector.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/context/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/coordination/AgentRunCoordinator.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/evaluation/gateEvaluators.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/evaluation/stageBuilders.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/evidence/EvidenceLedgerStore.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/evidence/ProductionEvidenceLedgerAuthority.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/evidence/loopLedger.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/ActiveContext.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/MemoryConsolidator.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/MemoryCoordinator.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/MemoryFlushContract.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/PersistentMemory.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/SessionStore.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/SessionStoreSchema.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/memory/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/policies/BudgetPolicy.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/policies/Policy.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/policies/PolicyEngine.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/policies/QualityGatePolicy.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/policies/SafetyPolicy.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/production/strict/expressions.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/AgentProfileCompiler.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/AgentStageFactoryRegistry.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/definitions/generate.profile.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/definitions/module-mining/ScopedModuleMiningProfile.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/presets/chatPreset.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/presets/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/presets/insightPreset.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/profiles/presets/types.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/prompts/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/prompts/insightAnalyst.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/prompts/insightProducer.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/AgentEventBus.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/AgentMessage.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/AgentRuntime.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/AgentRuntimeResponsibility.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/AgentRuntimeTypes.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/AgentState.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/BudgetController.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/DiagnosticsCollector.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/ExitController.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/HookSystem.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/LoopContext.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/PcvNodeEvidenceRecorder.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/SystemPromptBuilder.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/ToolExecutionPipeline.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/toolPipeline/contracts.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/toolPipeline/engine.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/toolPipeline/observations.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/toolPipeline/phaseGates.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/runtime/toolPipeline/runtimeBridge.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/service/AgentRunContracts.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/service/AgentRuntimeBuilder.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/service/SystemRunContextFactory.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/strategies/PipelineStrategy.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/strategies/Strategy.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/strategies/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/utils/Redaction.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/utils/redaction/detectors.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/utils/redaction/hiddenSpans.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/utils/redaction/legacyFloor.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/utils/redaction/render.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/agent/utils/redaction/trackedReplay.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/AiFactory.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/AiProvider.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/AiProviderManager.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/contracts.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/gateway/LLMGateway.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/gateway/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/management/contracts.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/providers/ClaudeProvider.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/providers/DeepSeekProvider.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/providers/GoogleGeminiProvider.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/providers/OllamaProvider.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/providers/OpenAiProvider.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/registry/ModelRegistry.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/transport/ClaudeTransport.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/transport/DeepSeekTransport.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/transport/GoogleTransport.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/transport/LLMTransport.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/ai/transport/OpenAiTransport.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/evaluation.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/catalog/CapabilityCatalog.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/catalog/UnifiedToolCatalog.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/kernel/context.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/kernel/decision.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/kernel/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/kernel/manifest.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/kernel/registry.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/kernel/request.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/availability.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/cache/SearchCache.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/handlers/code.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/handlers/graph.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/handlers/knowledge/authoring.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/handlers/knowledge/queries.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/handlers/knowledge/sessionState.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/handlers/recipeProductionAdapter.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/handlers/terminalSafety.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/registry.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/router.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/toolsets/CapabilityRegistry.ts",
+      "kind": "source"
+    },
+    {
+      "path": "src/tools/runtime/toolsets/index.ts",
+      "kind": "source"
+    },
+    {
+      "path": "test/ActiveContext.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/AiFactory.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/ContextWindow.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/EvidenceLedgerStore.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/ExplorationStrategies.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/LLMGateway.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/active-context-runtime-envelope.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-context-memory-doc-drift.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-dcr-retirements.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-entry-comment-type-drift.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-event-bus-subscription-cleanup.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-lifecycle.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-message-reply-delivery.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-profile-compiler-session-fields.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-run-coordinator-abort-policy.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-runtime-internal-cleanup.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-state-snapshot-copy.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-surface-floor.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/ai-configuration.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/ai-provider-manager.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/budget-controller-l4-switch.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/capability-registry-system-interaction.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/code-outline-port.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/contract-surface.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/conversation-capability.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/conversation-soul-resolution.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/durable-semantic-review-runtime.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/evidence-ledger-readback.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/evidence-recording-phase-chain.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/exit-controller-runtime-timeout.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/exit-controller-unwired-methods.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/exit-controller.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/fixtures/public-strict-consumer/strict-facades.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/fixtures/redaction-catalog/fuzzCorpus.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/fixtures/redaction-catalog/legacyRegressionOracle.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/generate-analyze-budget.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/hook-system-event-constants.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/hook-system.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/insight-analyst-budget-baseline.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/insight-analyst-graph-diagnostics.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/llm-input-layering.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/loopLedger-synthesis-dimension-ids.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/memory-consolidation-empty-candidate-guard.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/memory-context.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/memory-coordinator-cache-proxy.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/memory-session-store-lazy-cleanup.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/mining-e2e-pipeline.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/module-mining-agent-run.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/native-provider-sdk.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/openai-sdk.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/plan-agent-run.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/production-evidence-ledger-authority.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/provider-facades.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/recipe-production-han-collation.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/recipe-production-profile-adapter.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-detectors.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-floor-fuzz.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-floor-performance.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-floor-properties.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-legacy-floor.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-render.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-tracked-replay.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/runtime-efficiency.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/runtime-terminal-safety.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/shared-ai-utils.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/strict-canonical-golden.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/strict-production-chain-closure.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/structured-output-validation.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-availability-prompt.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-availability.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-contract-comments.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-pipeline-dead-links.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-runtime-comment-audit.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-runtime-contract.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-runtime-legacy-host-compat.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-schema-projection.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/tool-system.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/transport-protocols.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/transport-proxy.test.ts",
+      "kind": "test"
+    }
+  ],
+  "addedPaths": [
+    {
+      "path": "src/agent/utils/redaction/sourcePolicy.ts",
+      "kind": "source"
+    },
+    {
+      "path": "test/agent-policy-budget-exit-narrowing.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-runtime-provider-contract-defect.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-runtime-tool-registry-port.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/agent-stale-text-closeout.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/ai-provider-probe-thinking.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/conversation-store-legacy-summary.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/gate-evaluators-scan-stage-narrowing.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/memory-retired-members.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-source-policy-performance.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-source-policy-replay-share.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/redaction-source-policy.test.ts",
+      "kind": "test"
+    },
+    {
+      "path": "test/terminal-safety-path-escape-wrappers.test.ts",
+      "kind": "test"
+    }
+  ],
+  "representativeSemanticChanges": [
+    {
+      "subject": "replyFn transport write-back",
+      "state": "retired in current source",
+      "evidence": [
+        "src/agent/runtime/AgentMessage.ts",
+        "src/agent/runtime/AgentRuntime.ts"
+      ],
+      "note": "Do not treat the v4 hanging replyFn observation as a current unresolved branch without checking the new host-owned delivery boundary."
+    },
+    {
+      "subject": "SessionStore checkpoint and MemoryCoordinator lifecycle convenience methods",
+      "state": "retired in current source",
+      "evidence": [
+        "src/agent/memory/SessionStore.ts",
+        "src/agent/memory/MemoryCoordinator.ts",
+        "test/memory-retired-members.test.ts"
+      ],
+      "note": "Current snapshots use toJSON/fromJSON; host persistence responsibility must be re-described."
+    },
+    {
+      "subject": "old FanOutStrategy and kernel/toolset files",
+      "state": "removed",
+      "evidence": [
+        "src/agent/coordination/AgentRunCoordinator.ts"
+      ],
+      "note": "A retired strategy file is not proof the coordinator fanout capability disappeared."
+    },
+    {
+      "subject": "source-aware T3 ledger redaction",
+      "state": "new, no authored atlas body mention at this sampling",
+      "evidence": [
+        "src/agent/utils/redaction/sourcePolicy.ts",
+        "src/agent/evidence/ProductionEvidenceLedgerAuthority.ts"
+      ],
+      "note": "A broad document input glob includes the new source; that is not semantic explanation coverage."
+    }
+  ],
+  "notPerformed": [
+    "Product runtime edits",
+    "Atlas implementation or existing documentation refresh",
+    "Product tests or full Atlas npm run check",
+    "New browser render or live browser usability assessment",
+    "Core build/test or internal acceptance",
+    "Commit, push, publication, workflow dispatch or automation"
+  ],
+  "planningBoundary": "Only new assessment/roadmap files in the independent Agent atlas. Existing maps, histories, runtime code, source fingerprints and pass receipts are preserved."
+}

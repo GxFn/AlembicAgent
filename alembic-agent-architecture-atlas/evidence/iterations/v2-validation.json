@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "iteration": 2,
+  "checkedAt": "2026-10-22T11:41:29.737Z",
+  "command": "npm run check",
+  "status": "pass",
+  "node": "v24.19.0",
+  "tests": {
+    "parserAndEvidence": 18,
+    "readerLogicAndLoading": 8,
+    "realPilotScenarios": 6,
+    "total": 32
+  },
+  "typecheck": "pass",
+  "lint": "pass",
+  "sourceAndAnchors": "pass",
+  "browserRender": {
+    "status": "pass",
+    "diagrams": 72,
+    "receipt": "render/current.json",
+    "latestAttempt": "render/latest-attempt.json"
+  },
+  "build": "pass",
+  "bundleReport": "bundle-report.json",
+  "browserQA": {
+    "schemaVersion": 1,
+    "checkedAt": "2026-10-22T11:41:29.739Z",
+    "checks": [
+      {
+        "name": "72 actual Mermaid renders with latest-attempt receipt",
+        "result": "pass"
+      },
+      {
+        "name": "leave verification and switch history: cancelled record and read-only history verification page",
+        "result": "pass"
+      },
+      {
+        "name": "rapid historical selection followed by current view",
+        "result": "pass"
+      },
+      {
+        "name": "historical renderer version and pilot remain isolated",
+        "result": "pass"
+      },
+      {
+        "name": "lazy Mermaid and dependency-engine loading",
+        "result": "pass"
+      },
+      {
+        "name": "dependency direction/type filters after async load",
+        "result": "pass"
+      },
+      {
+        "name": "built site current data and selected v2 snapshot",
+        "result": "pass"
+      }
+    ],
+    "consoleErrorsInFinalRegression": 0,
+    "screenshots": [
+      "home-v2-1440.png",
+      "home-v2-390.png"
+    ],
+    "narrowViewport": {
+      "requestedWidth": 390,
+      "contentWidth": 375,
+      "scrollWidth": 375,
+      "horizontalOverflow": false
+    },
+    "notes": [
+      "Native browser default viewport restored after QA.",
+      "The dev-server restart temporarily invalidated an earlier browser error tab; the final stable page completed all 72 renders.",
+      "Delayed begin race and malformed/missing receipt cases were checked by deterministic regression tests, not by claiming a browser network-delay simulation."
+    ]
+  },
+  "baselineCommit": "34c62eda7082732e7a6e8bc45fec4e2121c9653e",
+  "sourceInventoryFingerprint": "sha256:5f5cb1df8c5246d21354af46064dcb2ff31522405d313474d75b83652a069236",
+  "documents": 46,
+  "topics": 13,
+  "sourceFiles": 293,
+  "currentSnapshot": "agent-atlas-2026-10-22-v2",
+  "initialJavaScriptBytes": 115963,
+  "currentDataBytes": 2100894,
+  "productFilesChangedDuringContinuation": 0,
+  "historicalSnapshotsPreserved": true,
+  "fixes": [
+    "Current data, history assets and graph engines load separately with content digests.",
+    "Late history selection success/failure cannot replace newer selection.",
+    "Render begin uses prior identity; late begin/finish/cancel cannot supersede the latest owner.",
+    "Latest render attempts, successful receipts and input identity are independently checked.",
+    "Historical evidence never falls back to current receipts.",
+    "Malformed evidence and stale reading hashes remain explicit."
+  ],
+  "warnings": [
+    "Large Mermaid/ELK chunks still exist but are loaded on demand, outside the initial static JavaScript closure.",
+    "Current graph/document JSON is approximately 2.1 MB and loaded separately; this is not a claim of 99% reduction in total network traffic.",
+    "26 unresolved module requests remain explicitly bounded."
+  ],
+  "notRun": [
+    "whole product test suite",
+    "live AI providers",
+    "production host acceptance"
+  ],
+  "noCommitReason": "Continuation authorized atlas refinement; commit, push and publication were not requested."
+}

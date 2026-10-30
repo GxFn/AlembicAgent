@@ -1,0 +1,896 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-23T15:23:51.845Z",
+  "status": "pass",
+  "scope": "Current full text review of the 53 source files that were partial in v5; independent Atlas only.",
+  "snapshot": {
+    "id": "agent-atlas-2026-10-23-v6",
+    "schemaVersion": 2,
+    "integrity": {
+      "algorithm": "sha256-canonical-json-v1",
+      "digest": "sha256:9dd74d75dd248695e0c4c5c2c6f078eebbcb1554b02628a40a7ff133b5baae3e"
+    }
+  },
+  "review": {
+    "files": 53,
+    "inventoryLines": 33370,
+    "segments": 323,
+    "branches": {
+      "located": 169,
+      "uncovered": 40
+    },
+    "sourceFullRecords": 290,
+    "freshFull": 53,
+    "inheritedSameBytes": 237,
+    "evidence": "evidence/reviews/source-full-v6.json",
+    "appliedCorrections": {
+      "schemaVersion": 1,
+      "checkedAt": "2026-10-23T15:18:44.533Z",
+      "scope": "Current Atlas prose/reference corrections only; original snapshots remain unchanged.",
+      "groups": [
+        {
+          "schemaVersion": 1,
+          "reviewedAt": "2026-10-23",
+          "scope": "existing four pages under maps/07-memory-context only; product and global Atlas artifacts unchanged",
+          "pages": [
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "sha256Before": "sha256:ee683f8b14100358ea21d674b268bbca5f5e2f91dd3f61905db0f4d7e91e9f54",
+              "sha256After": "sha256:ed4100591814b4bfb49b0736c07b3674e0963ee1f7b4244f95a44f6ffece0c16",
+              "sourceFingerprint": "sha256:81f03d8fe5ee24d98a7d6e728a8301acd9564e0b4b17741af5e5a3aa78c44980",
+              "diagramsUnchanged": true,
+              "edgeIdsUnchanged": true,
+              "sourcePathsAdded": [],
+              "testsRun": false
+            },
+            {
+              "page": "maps/07-memory-context/call-flow.md",
+              "sha256Before": "sha256:27f2eb0d5d4164dafccd230e7eee95b3bf7ae9d0e1550e0d7f1ba56d440b9afa",
+              "sha256After": "sha256:c90c1dcffc1c23c02eeb9ac846e39b0f4e0d1ff551ffbd1664dbcca07dbf49c1",
+              "sourceFingerprint": "sha256:458f90e35d64a1f5acaf0dc0d9840211eaae12aca70882e8db710711bb64cbbd",
+              "diagramsUnchanged": true,
+              "edgeIdsUnchanged": true,
+              "sourcePathsAdded": [
+                "src/agent/runtime/ToolExecutionPipeline.ts",
+                "src/agent/runtime/toolPipeline/callNormalization.ts",
+                "src/agent/runtime/toolPipeline/phaseGates.ts",
+                "src/agent/runtime/toolPipeline/accessGates.ts",
+                "src/ai/transport/sdkProtocol.ts",
+                "src/tools/kernel/toolSelection.ts"
+              ],
+              "testsRun": false
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "sha256Before": "sha256:955dfe162528efdb12286f5a10ee0fb11f7e1492b634140df2b5310638a048fd",
+              "sha256After": "sha256:47d93d0917e18fc60eb5c0d6d3fca2df808f82bff2e596a535900829e6380bc6",
+              "sourceFingerprint": "sha256:b3bc516f3865ce521d53602e8b1318ac166e3f0d98ed362027fd4fe2e98df0e4",
+              "diagramsUnchanged": true,
+              "edgeIdsUnchanged": true,
+              "sourcePathsAdded": [],
+              "testsRun": false
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "sha256Before": "sha256:80f115d20fc672fe746c56bac08673b418e14cbd81b6fd9c033e02db25877dd6",
+              "sha256After": "sha256:2e98b649e048d6e77c61e643be2bd400e9408acf2f33d9d63765db1f8f033f69",
+              "sourceFingerprint": "sha256:126b8dfae3a91fc39b430d3f95936cca3a39ecc62aec816129c71bf0863a0679",
+              "diagramsUnchanged": true,
+              "edgeIdsUnchanged": true,
+              "sourcePathsAdded": [],
+              "testsRun": false
+            }
+          ],
+          "changes": [
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "change": "补新全文深读导航"
+            },
+            {
+              "page": "maps/07-memory-context/call-flow.md",
+              "change": "补新全文深读导航"
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "change": "补新全文深读导航"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "补新全文深读导航"
+            },
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "change": "明确动态工作记忆投影内容与scope/mode预算边界"
+            },
+            {
+              "page": "maps/07-memory-context/call-flow.md",
+              "change": "明确动态工作记忆投影内容与scope/mode预算边界"
+            },
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "change": "区分预算内记忆片段与ContextWindow软触发预算"
+            },
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "change": "保留L4失败闭环并标明try外输入异常"
+            },
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "change": "明确证据索引缺席与显式空的恢复差异"
+            },
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "change": "补观察条目数与压缩软上限"
+            },
+            {
+              "page": "maps/07-memory-context/overview.md",
+              "change": "区分当前全文阅读与历史执行事实"
+            },
+            {
+              "page": "maps/07-memory-context/call-flow.md",
+              "change": "固化调用边保留事务回滚但不掩盖全无效输入缺口"
+            },
+            {
+              "page": "maps/07-memory-context/call-flow.md",
+              "change": "补L4调用边结构化失败回执的边界"
+            },
+            {
+              "page": "maps/07-memory-context/call-flow.md",
+              "change": "区分RECORD阶段gate允许、当轮schema广告、SDK返回验证与执行管道联合准入，并说明宽fixture替身边界"
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "change": "修正Consolidator→Store聚合边同时有type/value导入"
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "change": "修正Retriever→Store聚合边类型含义"
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "change": "修正Persistent→Consolidator聚合边类型含义"
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "change": "修正Persistent→Retriever聚合边类型含义"
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "change": "保留AST边并标注人工语义修正"
+            },
+            {
+              "page": "maps/07-memory-context/file-dependency.md",
+              "change": "说明同文件聚合导入不等同第一条导入语义"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "把旧delta说明更新为当前全文阅读，明确未运行"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "去掉已不适用的仅差异复核标题"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "保留原E-V4M-03及图语义"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "收窄scope投影边内容"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "逐边纠正测试fixture说明，区分Coordinator/ActiveContext、SessionStore、Promise/故障端口替身"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "限制输入验证保证到实际报告/digest/reflection入口"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "明确dispose清理而非封闭对象"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "保留单项候选/扩展快照验证缺口"
+            },
+            {
+              "page": "maps/07-memory-context/source-review-and-recovery.md",
+              "change": "补ActiveContext条目窗口/动态投影与保留失败闭环"
+            }
+          ],
+          "recordOnlyFinding": {
+            "gateAllowed": [
+              "note_finding",
+              "memory.note_finding",
+              "memory.recall",
+              "memory.get_previous_evidence",
+              "evidence.get",
+              "evidence.search"
+            ],
+            "advertised": "only direct note_finding and previously projected evidence if memory schema + memory.note_finding allowed; otherwise []",
+            "sdkBoundary": "sdkResponse validates against request.tools; unadvertised memory name rejected; custom provider can bypass SDK",
+            "pipelineBoundary": "allowlist/arg bounds/safety/scenario gates precede router; broad local fixtures are not whole-chain proof",
+            "uncovered": "No new or located single combined assertion covers actual RECORD schema + SDK rejection + action allowlist + real memory handler for recall/get_previous_evidence.",
+            "sourceRefs": [
+              "src/agent/runtime/toolPipeline/callNormalization.ts#resolveRecordOnlyStageTrigger",
+              "src/agent/runtime/toolPipeline/phaseGates.ts#recordRepairOnlyGate",
+              "src/agent/runtime/AgentRuntime.ts#getIterationToolSchemas",
+              "src/agent/runtime/AgentRuntime.ts#canUseDirectNoteFinding",
+              "src/ai/transport/sdkProtocol.ts#sdkResponse",
+              "src/agent/runtime/ToolExecutionPipeline.ts#createToolPipeline",
+              "src/agent/runtime/toolPipeline/accessGates.ts#allowlistGate",
+              "src/tools/kernel/toolSelection.ts#isToolActionAllowed"
+            ],
+            "testsLocated": [
+              {
+                "ref": "test/AgentRuntime.test.ts#case:does%20not%20force%20toolChoice%20none%20on%20the%20last%20record_repair%20round%20and%20records%20its%20note_finding",
+                "assertion": "three captured provider calls advertise note_finding/evidence with auto and three note_finding calls reach controlled router",
+                "boundary": "real AgentRuntime plus injected mock Provider and router, not SDK or actual memory handler"
+              },
+              {
+                "ref": "test/runtime-efficiency.test.ts#case:lets%20analyst%20RECORD%20%24label%20through%20to%20the%20router",
+                "assertion": "four parameterized call shapes reach controlled router with blocked=false",
+                "boundary": "direct default pipeline; wide allowedToolIds and absent action narrowing; does not test actual per-iteration schema or SDK"
+              }
+            ]
+          },
+          "verification": {
+            "status": "validated",
+            "pages": [
+              {
+                "page": "maps/07-memory-context/overview.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagramCount": 1,
+                "edgeCount": 4
+              },
+              {
+                "page": "maps/07-memory-context/call-flow.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagramCount": 3,
+                "edgeCount": 9
+              },
+              {
+                "page": "maps/07-memory-context/file-dependency.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagramCount": 2,
+                "edgeCount": 8
+              },
+              {
+                "page": "maps/07-memory-context/source-review-and-recovery.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagramCount": 2,
+                "edgeCount": 9
+              }
+            ],
+            "productTestsRun": false,
+            "whitespace": {
+              "command": "git diff --no-index --check <before> <current> for each of the four pages",
+              "result": "no whitespace diagnostics; exit 1 reflects content differences"
+            },
+            "preservedDiagrams": {
+              "diagramBlocks": 8,
+              "activeEdgeRows": 30,
+              "result": "all Mermaid source blocks and original E-ID sets byte-for-byte unchanged"
+            },
+            "assignedSourceDrift": []
+          },
+          "limitations": [
+            "No product or external-host behavior changed.",
+            "No global readings/scripts/snapshots edited.",
+            "All old failure/recovery diagrams and E IDs preserved."
+          ],
+          "noCommitReason": "Bounded Atlas sub-review; parent integrates documentation and evidence in the primary checkout."
+        },
+        {
+          "schemaVersion": 1,
+          "reviewedAt": "2026-10-23T14:35:48.979442+00:00",
+          "scope": "Only maps/03-runtime-lifecycle existing pages and assigned full-source-review; full-policy-review untouched.",
+          "changes": [
+            {
+              "file": "maps/03-runtime-lifecycle/overview.md",
+              "change": "补全文深读导航，保留L2职责页定位。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/overview.md",
+              "change": "限定L4失败归类与已发生副作用，不将后置异常等同未执行。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/overview.md",
+              "change": "区分历史执行证据、差异复核与本轮全文。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/call-flow.md",
+              "change": "补全文导航。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/call-flow.md",
+              "change": "将usage同时写入改为实际顺序，说明非原子副作用。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/call-flow.md",
+              "change": "限定清理隔离为拒绝/抛错，不承诺挂起也能返回。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/file-dependency.md",
+              "change": "补全文导航；静态依赖图与历史撤回E-ID保持。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/state-and-recovery.md",
+              "change": "补故障与全文导航。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/state-and-recovery.md",
+              "change": "避免把调用释放端口写成已成功回收。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/state-and-recovery.md",
+              "change": "明确独立AgentState不是当前Runtime状态实现。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "change": "保留原审阅来源，同时接入本轮全文，不扩大全文计数。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "change": "补全文页导航。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "change": "补record-only局部门、基础动作白名单与SDK本轮schema三层边界。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "change": "限制零行为的指代，不把整条观察链写成零副作用。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "change": "明确persisted=0诊断与实际已落账不等价。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "change": "区分确认历史与PCV/消息/事件完成。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "change": "补返回后metadata未登记仍需宿主读回的边界。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/full-source-review.md",
+              "change": "全文页反向链接刚核对的准入边界。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/full-source-review.md",
+              "change": "把分段说明的放行限定为单门。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/full-source-review.md",
+              "change": "移除全链允许隐藏动作的误读。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/full-source-review.md",
+              "change": "恢复入口指向实际组合约束。"
+            },
+            {
+              "file": "maps/03-runtime-lifecycle/full-source-review.md",
+              "change": "区分EvidenceLedgerStore台账事实与ActiveContext内存观察/finding，不把后者笼统描述为磁盘持久化。"
+            }
+          ],
+          "editedFiles": [
+            {
+              "path": "maps/03-runtime-lifecycle/overview.md",
+              "beforeSha256": "sha256:136f1007825853a5ca3b39fb509361c9e9935cc54952fbeaf90d5c936f765de5",
+              "afterSha256": "sha256:dbf718b1dea913457cf66697cd83c3dcc9e888da68c52173f7680876c6eef7fb",
+              "edgeIdsPreserved": [
+                "E-T03-A-01",
+                "E-T03-A-02",
+                "E-T03-A-03",
+                "E-T03-A-04"
+              ],
+              "purpose": "navigation and bounded semantic corrections"
+            },
+            {
+              "path": "maps/03-runtime-lifecycle/call-flow.md",
+              "beforeSha256": "sha256:fcc96f75c59fd09f0845c1b9e3e4630eb9c2b53ed161f7472fcd344160ebab0c",
+              "afterSha256": "sha256:6533fb1dfbf14675579660604a846a8f11aac5870376526e21918975b05ee100",
+              "edgeIdsPreserved": [
+                "E-T03-C1-01",
+                "E-T03-C1-02",
+                "E-T03-C1-03",
+                "E-T03-C1-04",
+                "E-T03-C2-01",
+                "E-T03-C2-02",
+                "E-T03-C2-03",
+                "E-T03-C2-04"
+              ],
+              "purpose": "navigation and bounded semantic corrections"
+            },
+            {
+              "path": "maps/03-runtime-lifecycle/file-dependency.md",
+              "beforeSha256": "sha256:ee901bd76ed42bebfea41992acd3f9f8a509414781f10845f54141172465ef17",
+              "afterSha256": "sha256:7254f12ba408fc1c1b6010c947f4423c9239f42f8ff2bfbce856595445c02ff5",
+              "edgeIdsPreserved": [
+                "E-T03-D1-01",
+                "E-T03-D1-02",
+                "E-T03-D1-03",
+                "E-T03-D1-04",
+                "E-T03-D2-01",
+                "E-T03-D2-02",
+                "E-T03-D2-03",
+                "E-T03-D2-04"
+              ],
+              "purpose": "navigation and bounded semantic corrections"
+            },
+            {
+              "path": "maps/03-runtime-lifecycle/state-and-recovery.md",
+              "beforeSha256": "sha256:d89b86ed839cfd00c10d1f6c50c59c121c9447b47d3ed6c5ac5d357a619c3000",
+              "afterSha256": "sha256:dbf69ff3c0be7534d6b1f246ac2355e231d40173e70b5d95e1d5987dba527190",
+              "edgeIdsPreserved": [
+                "E-STATE-01",
+                "E-STATE-02",
+                "E-STATE-03",
+                "E-STATE-04",
+                "E-STATE-05",
+                "E-STATE-06",
+                "E-STATE-07"
+              ],
+              "purpose": "navigation and bounded semantic corrections"
+            },
+            {
+              "path": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+              "beforeSha256": "sha256:14f7116330e47bad70901b633e8f092df92fad85368571dc7af246d936677e7c",
+              "afterSha256": "sha256:ff76493c7468ef10e83878a65d2e062664d34910632136167c379fd9840ffbef",
+              "edgeIdsPreserved": [
+                "E-V4R-01",
+                "E-V4R-02",
+                "E-V4R-03",
+                "E-V4R-04",
+                "E-V4R-05",
+                "E-V4R-06",
+                "E-V4R-07",
+                "E-V4R-08",
+                "E-V4R-09",
+                "E-V4R-10",
+                "E-V4R-11",
+                "E-V4R-12",
+                "E-V4R-13",
+                "E-V4R-14",
+                "E-V4R-15",
+                "E-V4R-16",
+                "E-V4R-17",
+                "E-V4R-18",
+                "E-V4R-19",
+                "E-V4R-20",
+                "E-V4R-21",
+                "E-V4R-22",
+                "E-V4R-23",
+                "E-V4R-24",
+                "E-V4R-25",
+                "E-V4R-26",
+                "E-V4R-27"
+              ],
+              "purpose": "navigation and bounded semantic corrections"
+            },
+            {
+              "path": "maps/03-runtime-lifecycle/full-source-review.md",
+              "beforeSha256": "sha256:bc3fb9f882e55714e2fe38f446df6fdc2c828fb48d836803c81fd9ca23d056f4",
+              "afterSha256": "sha256:e6bd9b4b4815e2df5437ae5287f2657edca9829cb5abd615db9aed0f2edd9e82",
+              "edgeIdsPreserved": [
+                "E-FULLR-01",
+                "E-FULLR-02",
+                "E-FULLR-03",
+                "E-FULLR-04",
+                "E-FULLR-05",
+                "E-FULLR-06",
+                "E-FULLR-07",
+                "E-FULLR-08",
+                "E-FULLR-09",
+                "E-FULLR-10",
+                "E-FULLR-11",
+                "E-FULLR-12",
+                "E-FULLR-13",
+                "E-FULLR-14"
+              ],
+              "purpose": "navigation and bounded semantic corrections"
+            }
+          ],
+          "testExecution": "not-run",
+          "productEdits": false,
+          "sharedEvidenceEdits": false,
+          "consolidatedReviewRecord": "evidence/reviews/source-full-v6.json",
+          "crossChecks": [
+            {
+              "subject": "AgentState action failure",
+              "inputReview": "atlas-v6-full-policy.json / P-STATE-ACTION",
+              "verdict": "confirmed",
+              "evidence": [
+                {
+                  "ref": "src/agent/runtime/AgentState.ts#AgentState.send",
+                  "lines": [
+                    146,
+                    180
+                  ]
+                }
+              ],
+              "detail": "158先写phase，159替换合并data，163调用action；action抛错不会追加本次history(167-174)或发两个emit(178-179)。action自身对data的修改也未回滚。transition监听器抛错则启用history时其条目已追加，而phase事件未执行。",
+              "qualification": "这是独立AgentState直接调用合同；当前Runtime使用私有phase，不持有或订阅此类。未执行故障注入。"
+            },
+            {
+              "subject": "BudgetController L4 postprocessing failure",
+              "inputReview": "atlas-v6-full-policy.json / P-L4-POST",
+              "verdict": "confirmed-with-log-timing-qualification",
+              "evidence": [
+                {
+                  "ref": "src/agent/runtime/BudgetController.ts#BudgetController.executeL4IfPending",
+                  "lines": [
+                    368,
+                    471
+                  ]
+                },
+                {
+                  "ref": "src/agent/runtime/AgentRuntime.ts#AgentRuntime.callLLM",
+                  "lines": [
+                    1315,
+                    1325
+                  ]
+                }
+              ],
+              "detail": "428/429先累加共享input/output，430才调用loop usage callback；callback抛错进入449 catch，已计用量及可能已经压缩的窗口不回滚。Runtime回调先ctx.addTokenUsage再diagnostics，因此后者抛错时loop用量也已写。catch日志457若再抛，方法直接reject。",
+              "qualification": "415返回failed的warn与420成功info在usage写入之前，不能说所有日志异常都发生于usage之后；436 hardStop warn在usage之后。413失败计数已加，415或436日志再抛进入453会再加一次，这一特殊单次尝试重复计失败尚无本轮测试绑定。未修改full-policy-review或其临时报告。"
+            }
+          ],
+          "recordOnlyBoundary": {
+            "triggerSingleSource": true,
+            "advertisement": "AgentRuntime.getIterationToolSchemas仅生成该轮note_finding+已有evidence(条件不满足则空)，不改写initLoop基础allowedToolIds/actions。",
+            "pipelineAdmission": "默认工厂先allowlistGate的工具/动作检查，再runtimeSafetyGate和phaseGates；recordRepairOnlyGate的memory读取例外不能覆盖前门拒绝。",
+            "sdkBoundary": "sdkResponse用本次request.tools名字和参数schema验证返回提案；未广告memory不能通过。DeepSeek文本兼容按request工具名转译后仍交sdkResponse。",
+            "customProviderBoundary": "Runtime不独立再按当轮广告集合校验自定义provider返回；若绕SDK，仍需基础有效动作/安全/阶段/host门全部接受。此事实不是所有隐藏调用都可执行。",
+            "sourceRefs": [
+              "src/agent/runtime/AgentRuntime.ts#AgentRuntime.getIterationToolSchemas",
+              "src/agent/runtime/AgentRuntime.ts#AgentRuntime.initLoop",
+              "src/agent/runtime/toolPipeline/accessGates.ts#allowlistGate",
+              "src/agent/runtime/toolPipeline/phaseGates.ts#recordRepairOnlyGate",
+              "src/ai/transport/sdkProtocol.ts#sdkResponse",
+              "src/ai/transport/DeepSeekTransport.ts#DeepSeekTransport.chatWithTools"
+            ],
+            "testEvidence": "只读三轮record-only广告+finding实际路由，以及基础querySchemas有效动作拒绝的断言；未绑定隐藏动作标准SDK/自定义provider全链矩阵。"
+          },
+          "crossTopicItemsForMain": [
+            {
+              "id": "FULLR-X01",
+              "status": "confirmed-document-inaccuracy",
+              "target": "maps/11-observability/overview.md",
+              "lineAtReview": 141,
+              "currentClaim": "qualifiedPath 与 basename 引用判 ambiguous-path",
+              "correction": "共享qualifiedPath命中是ambiguous-path；仅basename冲突命中是ambiguous-basename；不同qualifiedPath共享同一absolute另为ambiguous-absolute-path。",
+              "sourceRefs": [
+                "src/agent/runtime/PcvNodeEvidenceRecorder.ts#normalizePcvProjectScopeSourceRef"
+              ],
+              "assertionRef": "test/evidence-recording-phase-chain.test.ts#case:keeps%20a%20unique%20absolute%20path%20verbatim%20and%20marks%20the%20colliding%20qualified%20path%20and%20basename%20ambiguous",
+              "action": "由主审修改该专题一句，保留绝对路径冲突分叉说明与测试锚点。"
+            },
+            {
+              "id": "FULLR-X02",
+              "status": "precision-follow-up-not-proven-contradiction",
+              "target": "maps/02-service-orchestration/stage-failures-and-prompts.md",
+              "detail": "先前docCorrections仅提出record-only可能混淆；本次检索未找到该页明确声称整链开放隐藏memory动作，勿把建议当现存缺陷。若主审补阶段权限说明，请链接Runtime record-only-boundaries并保持多层交集口径。"
+            },
+            {
+              "id": "FULLR-X03",
+              "status": "boundary-note-not-proven-contradiction",
+              "target": "maps/08-evidence-knowledge/failure-and-receipts.md",
+              "detail": "本次未在该页找到consumedEvidenceRefs=真实模型消费的直接宣称；PCV子串启发式和持久化端口区分已放Runtime全文页，建议跨专题链接，勿制造不存在的旧文错误。"
+            },
+            {
+              "id": "FULLR-X04",
+              "status": "main-owned-review-precision",
+              "target": "maps/03-runtime-lifecycle/full-policy-review.md",
+              "detail": "按crossChecks细化L4 logger前后时点及单次尝试可能重复计失败；此新页与/tmp full-policy报告均未修改。"
+            }
+          ],
+          "validation": {
+            "documentValidation": [
+              {
+                "path": "maps/03-runtime-lifecycle/overview.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagrams": 1,
+                "edges": 4
+              },
+              {
+                "path": "maps/03-runtime-lifecycle/call-flow.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagrams": 2,
+                "edges": 8
+              },
+              {
+                "path": "maps/03-runtime-lifecycle/file-dependency.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagrams": 2,
+                "edges": 7
+              },
+              {
+                "path": "maps/03-runtime-lifecycle/state-and-recovery.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagrams": 1,
+                "edges": 7
+              },
+              {
+                "path": "maps/03-runtime-lifecycle/runtime-failure-deep-review.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagrams": 3,
+                "edges": 27
+              },
+              {
+                "path": "maps/03-runtime-lifecycle/full-source-review.md",
+                "errors": [],
+                "freshness": "matched",
+                "diagrams": 2,
+                "edges": 14
+              }
+            ],
+            "relativeLinks": "all six edited pages checked; record-only anchor exists",
+            "trailingWhitespace": "none",
+            "allPreviousEdgeIdsPreserved": true,
+            "browserRender": "not-run; parent owns final unified rendering",
+            "productTests": "not-run"
+          },
+          "targetSourceHashesUnchanged": true,
+          "noCommitReason": "Independent Atlas correction review; parent owns final integration, validation and any commit."
+        },
+        {
+          "schemaVersion": 1,
+          "appliedAt": "2026-10-23T14:31:06.199328+00:00",
+          "scope": "Only four existing topic-06 Atlas pages; links and precise boundary wording; no graph/E-ID change",
+          "pages": [
+            {
+              "page": "maps/06-tool-execution/overview.md",
+              "sha256Before": "sha256:aa41fa11904e0459974927e318709d528c2c2301ab9186191f79b9fad7371dc6",
+              "sha256After": "sha256:65f6578b4d25659fcfdfd13400252dbb9a6f8746ca5afc7346211f059876549c",
+              "changes": [
+                {
+                  "reason": "加入本轮current-full-text入口，不把L2总览升格。",
+                  "before": "[真实调用](call-flow.md) · [直接依赖](file-dependency.md) · [阅读规范](../00-diagram-standard.md)",
+                  "after": "[真实调用](call-flow.md) · [直接依赖](file-dependency.md) · [当前全文与失败审阅](full-source-review.md) · [阅读规范](../00-diagram-standard.md)"
+                },
+                {
+                  "reason": "区分历史V4阅读/执行与本次全文阅读。",
+                  "before": "[继续阅读：终端失败与合同逐文件深读](terminal-failures-and-contracts.md)。第4轮新增全文分段、失败触发与实际执行依据。",
+                  "after": "[终端失败与合同逐文件深读](terminal-failures-and-contracts.md)保留第4轮阅读范围与原有执行引用；[当前全文审阅](full-source-review.md)记录本轮重新通读两个大文件的连续段落、精确断言和未覆盖分支。本轮新增引用只声明已定位，未运行测试。"
+                },
+                {
+                  "reason": "收窄黑名单safe与生产allowlist/测试入口关系。",
+                  "before": "详细流程与失败责任见[终端深读页](terminal-failures-and-contracts.md)。",
+                  "after": "详细流程与失败责任见[终端深读页](terminal-failures-and-contracts.md)及[当前全文审阅](full-source-review.md)。Evolution 的生产代码执行开关仍为 false；保留的 runner 规则测试入口不能当作生产能力已开放的证据。"
+                }
+              ]
+            },
+            {
+              "page": "maps/06-tool-execution/call-flow.md",
+              "sha256Before": "sha256:9e217a241ddb8a0825865032804809f9d63fd044c6fee4430a5c0cc2720b27a2",
+              "sha256After": "sha256:be3f904e3df898669ec7429be09d7f18e1fb00c500ad8152ce67a593ca3fa9b6",
+              "changes": [
+                {
+                  "reason": "关联新页，保留所有既有图和E-ID。",
+                  "before": "[职责与边界](overview.md) · [直接依赖](file-dependency.md)",
+                  "after": "[职责与边界](overview.md) · [直接依赖](file-dependency.md) · [当前全文与失败审阅](full-source-review.md)"
+                },
+                {
+                  "reason": "E-T06-C2-03只证明四态检查，不宣称原子性。",
+                  "before": "先确认磁盘存在性；存在且注入 deltaCache 时必须有先读指纹，且磁盘内容仍 fresh；拒绝时提示重新 code.read。",
+                  "after": "先确认磁盘存在性；存在且注入 deltaCache 时必须有先读指纹，且检查时磁盘内容仍 fresh；拒绝时提示重新 code.read。无 deltaCache 时透传；检查与后续普通 writeFile 之间不是原子 compare-and-swap，现有顺序外改测试不证明并发窗口已消除。"
+                }
+              ]
+            },
+            {
+              "page": "maps/06-tool-execution/file-dependency.md",
+              "sha256Before": "sha256:e9fc34bbb103dad9f4fc04439633907c24eba5acabf34231b070a6f73a03ed34",
+              "sha256After": "sha256:fcb6c8d7bcdc45447ddd00eba75bc5ff2536c2e262b5c2a65bd74460e551fb94",
+              "changes": [
+                {
+                  "reason": "增加阅读入口，不改变静态import图的证据层次。",
+                  "before": "[职责与边界](overview.md) · [真实调用](call-flow.md)",
+                  "after": "[职责与边界](overview.md) · [真实调用](call-flow.md) · [当前全文与失败审阅](full-source-review.md)"
+                }
+              ]
+            },
+            {
+              "page": "maps/06-tool-execution/terminal-failures-and-contracts.md",
+              "sha256Before": "sha256:47762d25a71ebf6629051d21f49e7fdccafa349de554385bbf2043b4e1fcc314",
+              "sha256After": "sha256:8c63c2e767a002a6baa11cd33ac10942e6316f6a13402d463a16e276252f21c0",
+              "changes": [
+                {
+                  "reason": "不覆盖V4/V5历史读取意义，链接V6真实全文依据。",
+                  "before": "本页保留V4逐段阅读记录，并按当前源码补充端口退役与terminalSafety差异复核。旧行段属于当时阅读索引，当前定位以符号和页面指纹为准。执行前拒绝、执行后失败、输出压缩失败、审计失败分开记录；显式status比兼容ok布尔值更能说明命令结局。真实OS隔离仍是宿主责任。",
+                  "after": "本页保留V4逐段阅读记录及V5端口退役、terminalSafety差异复核。旧行段属于当时阅读索引，当前定位以符号和页面指纹为准；本轮重新完整通读 code.ts 与 terminalSafety.ts 的记录另见[当前全文审阅](full-source-review.md)。执行前拒绝、执行后失败、输出压缩失败、审计失败分开记录；显式status比兼容ok布尔值更能说明命令结局。真实OS隔离仍是宿主责任。"
+                },
+                {
+                  "reason": "收窄默认diagnostics、137原因及附属Promise活性结论，保持既有E边。",
+                  "before": "这些变更原已存在于产品工作树，图谱只记录。code.ts/terminalSafety.ts本轮是完整变更块与受影响上下文复核，不冒称重新逐行读完整文件。断言已定位，实际执行见页面证据。",
+                  "after": "这些变更原已存在于产品工作树，图谱只记录。V5对 code.ts／terminalSafety.ts 只作完整变更块与受影响上下文复核；本轮已另行逐行通读当前两个文件，连续范围及读取前后哈希见[当前全文审阅](full-source-review.md)，不回改历史快照。新增断言仅定位、未执行；旧执行记录只在原输入与场景仍匹配时有效。\n\n当前回执还须区分宿主声明与实际隔离：`src/tools/runtime/handlers/terminal.ts#normalizeExecutorResult` 对缺失或坏形状 diagnostics 的缺省可为 sandboxed=true、fallbackUsed=false；这不证明 OS 沙箱或 intent 已实施。plain exec 本地计时器强杀转137而外部 signal 未中止时仍归 error／unknown-termination。压缩或审计异常能被隔离，不代表永久 pending 的宿主端口已经有本地完成期限；相关未覆盖项保留在新页。"
+                }
+              ]
+            }
+          ],
+          "limitations": [
+            "No tests/build/render/product edits",
+            "Cross-topic source-rebase suggestion left to main reviewer"
+          ]
+        }
+      ],
+      "additionalMainCorrections": [
+        {
+          "file": "maps/11-observability/overview.md",
+          "change": "qualifiedPath collision remains ambiguous-path; basename collision is ambiguous-basename."
+        },
+        {
+          "file": "maps/source-rebase.md",
+          "change": "v5 full/partial counts explicitly labeled historical; current full review linked via file index."
+        },
+        {
+          "file": "maps/file-index.md",
+          "change": "53 current full-text records plus 237 same-byte inherited full records; five deep-review links."
+        }
+      ],
+      "meaning": "Reviewer suggestions are evidence inputs. This record lists applied Atlas corrections, not authority to repair product code."
+    }
+  },
+  "content": {
+    "topics": 13,
+    "documents": 63,
+    "diagrams": 103,
+    "newDeepReviewPages": 5,
+    "unresolvedLoads": 27
+  },
+  "checks": {
+    "fullReview": {
+      "schemaVersion": 1,
+      "checkedAt": "2026-10-23T15:09:35.156Z",
+      "ok": true,
+      "baselineSnapshot": "agent-atlas-2026-10-23-v5",
+      "files": 53,
+      "lines": 33370,
+      "segments": 323,
+      "branches": 209,
+      "meaning": "Current hashes, contiguous semantic-section records, symbols and assertion identities checked. Full reading is not branch test coverage.",
+      "errors": []
+    },
+    "atlas": {
+      "command": "npm run check",
+      "status": "pass",
+      "nodeTests": 40,
+      "vitestTests": 17,
+      "includes": [
+        "typecheck",
+        "lint",
+        "check:current",
+        "check:render",
+        "build"
+      ]
+    },
+    "scoped": {
+      "command": "npm run test:scoped -- --resume",
+      "status": "pass",
+      "newlyExecutedGroups": 36,
+      "newlyExecutedCases": 496,
+      "reusedGroups": 76,
+      "currentGroups": 112,
+      "currentPassingCases": 1379,
+      "allInputsMatched": true,
+      "meaning": "Current aggregate includes reused runs; new execution is reported separately."
+    },
+    "render": {
+      "actualBrowserDiagrams": 103,
+      "renderer": "12.2.0",
+      "checkedAt": "2026-10-23T15:11:45.734Z"
+    },
+    "current": {
+      "status": "pass",
+      "errors": []
+    },
+    "afterSnapshot": [
+      "npm run build",
+      "node scripts/report-bundle.mjs",
+      "npm run check:current"
+    ],
+    "browser": {
+      "schemaVersion": 1,
+      "checkedAt": "2026-10-23T15:21:49.534Z",
+      "pages": [
+        {
+          "graphs": 1,
+          "overflow": false,
+          "sections": 13,
+          "title": "Profile与宿主装配：当前全文审阅",
+          "warnings": 0
+        },
+        {
+          "graphs": 2,
+          "overflow": false,
+          "sections": 13,
+          "title": "策略、预算与诊断：当前全文审阅",
+          "warnings": 0
+        },
+        {
+          "graphs": 2,
+          "overflow": false,
+          "sections": 5,
+          "title": "Runtime 与 PCV：当前全文阅读及失败边界",
+          "warnings": 0
+        },
+        {
+          "graphs": 2,
+          "overflow": false,
+          "sections": 6,
+          "title": "代码工具与终端规则：当前全文、失败与恢复边界",
+          "warnings": 0
+        },
+        {
+          "graphs": 2,
+          "overflow": false,
+          "sections": 7,
+          "title": "记忆与上下文 · 当前全文深读",
+          "warnings": 0
+        }
+      ],
+      "sourceEntrances": [
+        {
+          "file": "src/agent/runtime/AgentRuntime.ts",
+          "hasBehavior": true,
+          "metrics": "sourcefull · fresh3388 行 · 36 条被依赖边",
+          "reviewLink": "#/doc/03-runtime-full-source-review"
+        },
+        {
+          "file": "src/tools/runtime/handlers/terminalSafety.ts",
+          "hasBehavior": true,
+          "metrics": "sourcefull · fresh5171 行 · 5 条被依赖边",
+          "reviewLink": "#/doc/06-tool-full-source-review"
+        },
+        {
+          "file": "src/agent/context/ContextWindow.ts",
+          "hasBehavior": true,
+          "metrics": "sourcefull · fresh1902 行 · 16 条被依赖边",
+          "reviewLink": "#/doc/07-memory-context-full-source-review"
+        }
+      ],
+      "narrow": {
+        "graphs": 2,
+        "scrollWidth": 375,
+        "title": "策略、预算与诊断：当前全文审阅",
+        "width": 390
+      },
+      "newSnapshotLoaded": true,
+      "snapshot": "agent-atlas-2026-10-23-v6",
+      "screenshot": "evidence/ui/full-reading-v6.png",
+      "meaning": "Real local browser checks; full reading and behavior executions have separate records."
+    }
+  },
+  "scopePreservation": {
+    "checkedAt": "2026-10-23T15:23:51.819Z",
+    "baselineCommit": "37bdc7f7b6dc6e0fcc12b95de1dfa5251848b0b0",
+    "currentCommit": "37bdc7f7b6dc6e0fcc12b95de1dfa5251848b0b0",
+    "branch": "main",
+    "productFiles": 569,
+    "oldSnapshots": 6,
+    "oldPngs": 18,
+    "changed": [],
+    "newProductFiles": [],
+    "noCommitReason": "Independent Atlas source review; preserve user worktree. No commit, push or publication requested."
+  },
+  "limitations": [
+    "Full source reading is not exhaustive test coverage; 40 branch records retain explicit targeted-verification gaps.",
+    "237 unchanged source records were inherited, not re-read this turn.",
+    "AI providers and host boundaries are controlled fixtures; no real model, production host, OS isolation or Core internal acceptance.",
+    "Exact assertions with ambiguous duplicate template declarations remain unbound rather than guessed.",
+    "Static sampling does not monitor later source changes; old snapshots retain their original facts."
+  ],
+  "noCommitReason": "Independent Atlas source review; preserve user worktree. No commit, push or publication requested."
+}

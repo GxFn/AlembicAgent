@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "reviewedOn": "2026-10-23",
+  "meaning": "保留材料归属、摘要和失效事实；索引不替代原始测试回执。当前与封存版本依赖的结果仍保存在 results/。原始中间材料仅有本地忽略缓存副本，新检出不包含。",
+  "archives": [
+    {
+      "id": "legacy-v4",
+      "originalPath": "evidence/executions/history/91b0fcf006bfce29fa686891402af5ee71a23e91ba4ac356b41df8947e279212.json",
+      "originalSha256": "sha256:91b0fcf006bfce29fa686891402af5ee71a23e91ba4ac356b41df8947e279212",
+      "schemaVersion": 1,
+      "groups": 46,
+      "passingCases": 267,
+      "disposition": "duplicate-export-removed",
+      "retainedEvidence": {
+        "field": "scopedRuns",
+        "equivalence": "逐项比较相等；比较时仅移除快照追加的 inputFreshness 派生字段。",
+        "snapshotId": "agent-atlas-2026-10-22-v4",
+        "manifestPath": "evidence/snapshots/agent-atlas-2026-10-22-v4/snapshot.store.json",
+        "fieldMeaning": "field 指统一读取或恢复导出后的完整快照，不是物理存储清单字段。"
+      }
+    },
+    {
+      "id": "invalidated-harness-attempt",
+      "originalPath": "evidence/executions/history/8465d9959510799f28ee533ba524b62c4e4405a55172bcd8ea6ffab08b64a39b.json",
+      "originalSha256": "sha256:8465d9959510799f28ee533ba524b62c4e4405a55172bcd8ea6ffab08b64a39b",
+      "schemaVersion": 2,
+      "checkedAt": "2026-10-23T13:38:48.715Z",
+      "groups": 100,
+      "groupStates": {
+        "pass": 99,
+        "fail": 1
+      },
+      "disposition": "superseded-intermediate-run-removed",
+      "reason": "采集器编辑使一次中间尝试的输入稳定性检查失败，未发生产品断言失败；随后以固定采集器重新执行全部相同选择器。该失效尝试仍记录为 fail。",
+      "failedGroups": [
+        {
+          "id": "current-contract-surface",
+          "status": "fail",
+          "inputStableDuringRun": false,
+          "passed": 9,
+          "failed": 0,
+          "exitCode": 0,
+          "beforeFingerprint": "sha256:aa41ab9b2e792f7bfffb87b960df99a9c46f9fe328c6e08309ad3eeabd3fa9f9",
+          "afterFingerprint": "sha256:aa41ab9b2e792f7bfffb87b960df99a9c46f9fe328c6e08309ad3eeabd3fa9f9",
+          "harnessFingerprint": "sha256:e49dd7310b4cad53d66eac900c8d0f62ae1436fe9a9dae4ce2a1d705c303fb1d"
+        }
+      ],
+      "supersededBy": {
+        "field": "scopedRuns",
+        "sameGroupIdsAndSelectionDigests": true,
+        "allGroupsPassedWithStableInputs": true,
+        "replacementForFailedGroup": {
+          "id": "current-contract-surface",
+          "status": "pass",
+          "inputStableDuringRun": true,
+          "passed": 9,
+          "failed": 0,
+          "harnessFingerprint": "sha256:826f4d1a99559ac8a6bd371d7d888e1636091bd7141e08e1f7fd4d7acba9e118",
+          "resultArtifact": "evidence/executions/results/5dab3f74ec031fd6273c7a90f8e0c0d2cb7d426a75197e08d19718816d7dd75f.json"
+        },
+        "snapshotId": "agent-atlas-2026-10-23-v5",
+        "manifestPath": "evidence/snapshots/agent-atlas-2026-10-23-v5/snapshot.store.json",
+        "fieldMeaning": "field 指统一读取或恢复导出后的完整快照，不是物理存储清单字段。"
+      },
+      "intermediateOnlyResultsRemoved": 100
+    }
+  ],
+  "priorPlans": [
+    {
+      "originalPath": "evidence/executions/plans/e9537feabfbb8de80e475722d346aabb9640b3bd9a30824253d9523fe8f83794.json",
+      "sha256": "sha256:e9537feabfbb8de80e475722d346aabb9640b3bd9a30824253d9523fe8f83794",
+      "groups": 100,
+      "disposition": "completed-process-backup-excluded",
+      "retainedExecutionSource": {
+        "snapshotId": "agent-atlas-2026-10-23-v5",
+        "field": "scopedRuns",
+        "meaning": "Historical executed commands, selections, collections and results remain sealed. This does not recreate an old source checkout."
+      }
+    }
+  ]
+}

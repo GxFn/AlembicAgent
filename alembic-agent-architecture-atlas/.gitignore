@@ -1,0 +1,35 @@
+# 本地依赖、构建与缓存
+node_modules/
+dist/
+.cache/
+.sites-runtime/
+coverage/
+*.log
+.DS_Store
+
+evidence/live/
+
+# 本地历史资料不随 Git 提交；格式是 JSON 或 gzip 都按目录排除
+evidence/snapshots/
+evidence/current.json
+
+# UI观察已归入版本化验证报告；新临时材料应写入 .cache/
+evidence/ui/
+
+# 可重建的体积报告，以及版本化验证报告的重复导出
+evidence/bundle-report.json
+evidence/validation.json
+evidence/public-entrypoints.json
+
+# 升级采集格式时的原始中间归档；提交精简索引与已封存证据
+evidence/executions/history/
+evidence/executions/plans/
+
+# 完整结果已经内嵌在总报告/快照中，禁止重复提交逐组导出
+evidence/executions/results/
+
+# 已完整合并到相应版本化验证报告的过程副本
+evidence/iterations/v5-v7-scope.json
+evidence/iterations/v6-full-scope.json
+evidence/reviews/atlas-maintenance-review-*.json
+evidence/reviews/full-corrections-*.json

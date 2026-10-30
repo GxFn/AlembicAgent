@@ -1,0 +1,728 @@
+{
+  "renderer": "mermaid",
+  "rendererVersion": "12.2.0",
+  "checkedAt": "2026-10-23T15:11:45.734Z",
+  "results": [
+    {
+      "id": "01-overall-architecture-calls#1",
+      "digest": "sha256:36ff912bc6cc190b62b46bd0ef302f72add3534be6e81dc1b929efd1681a8719",
+      "status": "pass",
+      "width": 699,
+      "height": 192.9140625
+    },
+    {
+      "id": "01-overall-architecture-calls#2",
+      "digest": "sha256:a84987f3e1add3cd74e35794621e8bbdb11716b888b3f110b8d15e2c7b3bf58d",
+      "status": "pass",
+      "width": 479.21875,
+      "height": 247.5
+    },
+    {
+      "id": "01-overall-architecture-imports#1",
+      "digest": "sha256:65f937029813bad50d8cbf6a586358a23381adec05185431245b24fb05696740",
+      "status": "pass",
+      "width": 637.0390625,
+      "height": 349.9921875
+    },
+    {
+      "id": "01-overall-architecture-imports#2",
+      "digest": "sha256:f5249c1d8b7af5dfcdecefacfefe0e1a9102e9d0729c310376bc5d5cc21365ff",
+      "status": "pass",
+      "width": 699,
+      "height": 184.0078125
+    },
+    {
+      "id": "01-overall-architecture-overview#1",
+      "digest": "sha256:0a2365d5be764a79eb98e0e400b7517a98339aebf9ef4cc06547a34ef564abe2",
+      "status": "pass",
+      "width": 699,
+      "height": 142.625
+    },
+    {
+      "id": "01-public-api-and-hosts#1",
+      "digest": "sha256:76dd987aa39f9290f588b4acc6273b51576a926ed6795197abb661d7756b29e2",
+      "status": "pass",
+      "width": 654.1484375,
+      "height": 536.5
+    },
+    {
+      "id": "02-service-orchestration-calls#1",
+      "digest": "sha256:17d11f8ba7f1b6f7fb15dddec1962e9d0200f4880cae995c7ad9eb81206236fd",
+      "status": "pass",
+      "width": 699,
+      "height": 387.6875
+    },
+    {
+      "id": "02-service-orchestration-calls#2",
+      "digest": "sha256:d9a8d6139379cd10b99f1bbfac669edf963ee4fba777c516a897fc966d220290",
+      "status": "pass",
+      "width": 503.6796875,
+      "height": 428.3984375
+    },
+    {
+      "id": "02-service-orchestration-imports#1",
+      "digest": "sha256:f3c6675c6da718c1be3528baf7f59d2f8e76f4f5c98c49846b1bb6aeca8dcb7e",
+      "status": "pass",
+      "width": 446.296875,
+      "height": 350
+    },
+    {
+      "id": "02-service-orchestration-imports#2",
+      "digest": "sha256:165febcb7c3bc4dd824dd85cffa1930fd56601db428cbb3028af891d0da79ff8",
+      "status": "pass",
+      "width": 607.71875,
+      "height": 350
+    },
+    {
+      "id": "02-full-profile-review#1",
+      "digest": "sha256:64f53e3ccda9f7aa436797f7f37313007670971ae1f2315f23d4b7127e12aeff",
+      "status": "pass",
+      "width": 699,
+      "height": 294.71875
+    },
+    {
+      "id": "02-service-orchestration-overview#1",
+      "digest": "sha256:c9b03d16a0fe886a4e17dc26d11ead1b3fca9bc51f44f246619d407cc085287c",
+      "status": "pass",
+      "width": 627.609375,
+      "height": 349.9921875
+    },
+    {
+      "id": "02-stage-failures-and-prompts#1",
+      "digest": "sha256:ac754a59ab070706154c96b734fb5242bb383690e69e36b74e65db655b4207aa",
+      "status": "pass",
+      "width": 699,
+      "height": 650
+    },
+    {
+      "id": "02-stage-failures-and-prompts#2",
+      "digest": "sha256:f092fd617b9a38da5d42bfe79853200717a39fadde83ad827a0d490b67492d4c",
+      "status": "pass",
+      "width": 699,
+      "height": 122.0078125
+    },
+    {
+      "id": "02-stage-failures-and-prompts#3",
+      "digest": "sha256:74aa29259da68be7e9bb0bfa6dd813650254143db311a889508df8ce83ec52f8",
+      "status": "pass",
+      "width": 538.28125,
+      "height": 650
+    },
+    {
+      "id": "03-runtime-lifecycle-calls#1",
+      "digest": "sha256:3656a807b81c53d30809024dd2b8843321d3bd099f35b70ad197fceec3353056",
+      "status": "pass",
+      "width": 699,
+      "height": 228.7265625
+    },
+    {
+      "id": "03-runtime-lifecycle-calls#2",
+      "digest": "sha256:58994fc9bd244cccfdad71bd8a7558bf1a89851b358f527faa00cb343e669201",
+      "status": "pass",
+      "width": 699,
+      "height": 213.4609375
+    },
+    {
+      "id": "03-runtime-lifecycle-imports#1",
+      "digest": "sha256:502890f70c63e92be2c766c0a5c232ed6a4f6b30c2b9acb125b3d470ec924329",
+      "status": "pass",
+      "width": 625.2421875,
+      "height": 205.5
+    },
+    {
+      "id": "03-runtime-lifecycle-imports#2",
+      "digest": "sha256:f6bfb8114f9976cb2f4444175d0400bacc56bad28a33fb584d21b3f93693b11b",
+      "status": "pass",
+      "width": 699,
+      "height": 201.3671875
+    },
+    {
+      "id": "03-full-policy-review#1",
+      "digest": "sha256:8c99b47f9b8b611ba4ad82bcbd8258b9dfbbd37574162bada646b74c9c8b3572",
+      "status": "pass",
+      "width": 699,
+      "height": 360.4921875
+    },
+    {
+      "id": "03-full-policy-review#2",
+      "digest": "sha256:ae7f20513167ecc8d1db6d0508c83528a52c04db80510251d74abe2158751ab3",
+      "status": "pass",
+      "width": 699,
+      "height": 36.4921875
+    },
+    {
+      "id": "03-runtime-full-source-review#1",
+      "digest": "sha256:3904a11e9bdcba11b57a2a262755d50dea90e3c0a22774796fec76cd0bfe3a60",
+      "status": "pass",
+      "width": 699,
+      "height": 350.984375
+    },
+    {
+      "id": "03-runtime-full-source-review#2",
+      "digest": "sha256:4f13295e621ce3ed733e48a16733b7ce59d6b11abbe31341f754c45f8f923612",
+      "status": "pass",
+      "width": 561.78125,
+      "height": 582.6953125
+    },
+    {
+      "id": "03-runtime-lifecycle-overview#1",
+      "digest": "sha256:b781c5aae554da96d26fbbe3100679e708760bf2121d99b5d2dfe747b1c1366a",
+      "status": "pass",
+      "width": 578.75,
+      "height": 365.3984375
+    },
+    {
+      "id": "03-runtime-failure-deep-review#1",
+      "digest": "sha256:2c19338fd5f9ef5c410e9736b46193d6b929734860c60ba2be03ea392d8e0b6b",
+      "status": "pass",
+      "width": 699,
+      "height": 333.125
+    },
+    {
+      "id": "03-runtime-failure-deep-review#2",
+      "digest": "sha256:3de07f93ffcc7dbd53ec0b0cf5eda35cccf5b403238db282937a3225a0723e64",
+      "status": "pass",
+      "width": 393.4296875,
+      "height": 650
+    },
+    {
+      "id": "03-runtime-failure-deep-review#3",
+      "digest": "sha256:5f736553115dcb2f818c5b48a4409c298debd70220771b3685c67ce00be4525b",
+      "status": "pass",
+      "width": 699,
+      "height": 650
+    },
+    {
+      "id": "03-state-and-recovery#1",
+      "digest": "sha256:8ff7bc7e5c2bd1dffe3fb886ae8feea3cc83a0f2a1b17e882943323c52282381",
+      "status": "pass",
+      "width": 699,
+      "height": 233.9375
+    },
+    {
+      "id": "04-ai-protocols-calls#1",
+      "digest": "sha256:10d1a65dc73c3e67bac05805782e52052b8aeff2986acbc1818afed6fe740dae",
+      "status": "pass",
+      "width": 601.90625,
+      "height": 428.3984375
+    },
+    {
+      "id": "04-ai-protocols-calls#2",
+      "digest": "sha256:855118e26c2bedb68e66c9e71ebf7306e5058dd48b8c55155924f631a7aad3bd",
+      "status": "pass",
+      "width": 438.53125,
+      "height": 578.4921875
+    },
+    {
+      "id": "04-ai-protocols-calls#3",
+      "digest": "sha256:bf4bc404a248bf0addb13bc07e5db75db2c72bfff21d47289cd9d33060deab77",
+      "status": "pass",
+      "width": 188.8671875,
+      "height": 247.4921875
+    },
+    {
+      "id": "04-ai-protocols-calls#4",
+      "digest": "sha256:549155929659b865be56bf70fad14df9a64b2585bbd537bf793887027f9e2e37",
+      "status": "pass",
+      "width": 191.9296875,
+      "height": 650
+    },
+    {
+      "id": "04-ai-protocols-imports#1",
+      "digest": "sha256:daa910183c4670be1f22bd5c73b8ea1cfb8bc2c95dd4e932824fd878ffb2e80e",
+      "status": "pass",
+      "width": 552,
+      "height": 350
+    },
+    {
+      "id": "04-ai-protocols-imports#2",
+      "digest": "sha256:9dd8b4e12317344d8f3c583f1c0dbea202f9f679a93543ad2208bb129c62bb5c",
+      "status": "pass",
+      "width": 699,
+      "height": 211.859375
+    },
+    {
+      "id": "04-ai-protocols-overview#1",
+      "digest": "sha256:53daab56fdfce11882d3f9309b2657796cf3ab2a544fa5a591fcb0fd92fc3df8",
+      "status": "pass",
+      "width": 578.25,
+      "height": 365.3984375
+    },
+    {
+      "id": "05-tool-contracts-calls#1",
+      "digest": "sha256:bad1d124f3e05e73d09f222c61112102a47da1bae8a4bc3fa5aabb55a9597f49",
+      "status": "pass",
+      "width": 525.5234375,
+      "height": 428.3984375
+    },
+    {
+      "id": "05-tool-contracts-calls#2",
+      "digest": "sha256:b407e66b922c1356958ace23ee6bdd8de84b4c1cec455cdfee7f679ddef626bd",
+      "status": "pass",
+      "width": 697.1640625,
+      "height": 262.8984375
+    },
+    {
+      "id": "05-tool-contracts-calls#3",
+      "digest": "sha256:2b0eaa886e69850e3f7816aded91d4a8597e05ee98e4e085354449cc06d77d35",
+      "status": "pass",
+      "width": 572,
+      "height": 241.8984375
+    },
+    {
+      "id": "05-tool-contracts-imports#1",
+      "digest": "sha256:6d814d99576543612c8d6aa138babcc4a70728a825d4b50e97acdbea4cb0f1f4",
+      "status": "pass",
+      "width": 699,
+      "height": 202.09375
+    },
+    {
+      "id": "05-tool-contracts-imports#2",
+      "digest": "sha256:979c97ce522f3b5483cbcb29600955835772aaa7b81e6ae2c35033c80e63f8f2",
+      "status": "pass",
+      "width": 499.3125,
+      "height": 350
+    },
+    {
+      "id": "05-tool-contracts-overview#1",
+      "digest": "sha256:860a504dbe622280988cc154da19cd9f3085309da0635851146fa4bc05336fc9",
+      "status": "pass",
+      "width": 509.0703125,
+      "height": 365.3984375
+    },
+    {
+      "id": "06-tool-execution-calls#1",
+      "digest": "sha256:9348f0dd8cb9016769b8558b76ce300a6869068723411240dabbbe3c6338b615",
+      "status": "pass",
+      "width": 699,
+      "height": 379.234375
+    },
+    {
+      "id": "06-tool-execution-calls#2",
+      "digest": "sha256:8f5380f098dfbd3127ba15d91c5d206b45645d19869db9b1436033b0a74c723c",
+      "status": "pass",
+      "width": 699,
+      "height": 208.59375
+    },
+    {
+      "id": "06-tool-execution-imports#1",
+      "digest": "sha256:933d458c3e79f7133d52df4869b71bb084a8c08f31ad5c61a248cdbb78dc9f63",
+      "status": "pass",
+      "width": 699,
+      "height": 186.8984375
+    },
+    {
+      "id": "06-tool-execution-imports#2",
+      "digest": "sha256:a9334c7e0796053709da91e6eed4c91240fe7fda0bc3a59284d6f7f036e0fd87",
+      "status": "pass",
+      "width": 699,
+      "height": 181.703125
+    },
+    {
+      "id": "06-tool-full-source-review#1",
+      "digest": "sha256:c7f4e6f3b1c275cec2221b3ac6c046a48b7314157f37e9a98ae342b74c31123c",
+      "status": "pass",
+      "width": 566.1015625,
+      "height": 557.5
+    },
+    {
+      "id": "06-tool-full-source-review#2",
+      "digest": "sha256:db125fa64daae050584f7c75d27a62933518db158300c6b7dc694a99afa48478",
+      "status": "pass",
+      "width": 479.9609375,
+      "height": 650
+    },
+    {
+      "id": "06-tool-execution-overview#1",
+      "digest": "sha256:e49466c63f8c8db68f5f118ca1a3d644e56389bb3e2be18021e0a879823524d7",
+      "status": "pass",
+      "width": 657.125,
+      "height": 205.5
+    },
+    {
+      "id": "06-terminal-failures-and-contracts#1",
+      "digest": "sha256:e18d37f43ab205daeb3a408e842ddbdfdbdf82749bd059c83086354749888c87",
+      "status": "pass",
+      "width": 476.03125,
+      "height": 650
+    },
+    {
+      "id": "06-terminal-failures-and-contracts#2",
+      "digest": "sha256:3a9ec969df1b1eb0ba381739899507af6757fffc11882d6bccc9f70e531422c0",
+      "status": "pass",
+      "width": 699,
+      "height": 440.9296875
+    },
+    {
+      "id": "06-terminal-failures-and-contracts#3",
+      "digest": "sha256:8298991ef98d8db6e8ce34db29730fa160f736bb9d2a8efa458d5591a638c55c",
+      "status": "pass",
+      "width": 168,
+      "height": 650
+    },
+    {
+      "id": "07-memory-context-calls#1",
+      "digest": "sha256:7055bdf29e2da5a85449603348e554ed1dcc6046a039a20cb85cc22b19a5b379",
+      "status": "pass",
+      "width": 699,
+      "height": 195.6796875
+    },
+    {
+      "id": "07-memory-context-calls#2",
+      "digest": "sha256:0f9561319800c5ad67afcd60ed9a84833c38f7f9db761d52e5fd6f76d5db2475",
+      "status": "pass",
+      "width": 699,
+      "height": 197.5546875
+    },
+    {
+      "id": "07-memory-context-calls#3",
+      "digest": "sha256:01caacb5dd2b0260c0fe533685dd7230065b6bba35b7e67e1a919c96dd512b0a",
+      "status": "pass",
+      "width": 182.609375,
+      "height": 262.8984375
+    },
+    {
+      "id": "07-memory-context-imports#1",
+      "digest": "sha256:30c3752abe019091e460494869c67a0be34110716ba3785e4041a22b96bf9010",
+      "status": "pass",
+      "width": 699,
+      "height": 188.765625
+    },
+    {
+      "id": "07-memory-context-imports#2",
+      "digest": "sha256:338e871868aa731c8b7057f1ca7e92031a0e82c52ecd7b63b3f304a09bdb5ffb",
+      "status": "pass",
+      "width": 465.8984375,
+      "height": 349.9921875
+    },
+    {
+      "id": "07-memory-context-full-source-review#1",
+      "digest": "sha256:c235daea1e4dc109438759634ecfcbffbb29792ae1c0cf5ee9257882cbfcdd6a",
+      "status": "pass",
+      "width": 454.1015625,
+      "height": 609.296875
+    },
+    {
+      "id": "07-memory-context-full-source-review#2",
+      "digest": "sha256:bb26c3a9d47993b0921a9ef2d916a4d9d62c63e42b76c713b0b8b3a4ed8d1d64",
+      "status": "pass",
+      "width": 590.046875,
+      "height": 386.3984375
+    },
+    {
+      "id": "07-memory-context-overview#1",
+      "digest": "sha256:258f9a0751cf2b61ab0783b059dfe38a25b2a0c5db45341e922106596419a7bf",
+      "status": "pass",
+      "width": 440.7734375,
+      "height": 380.796875
+    },
+    {
+      "id": "07-source-review-and-recovery#1",
+      "digest": "sha256:8684e637707ed34add12ffef16ddaff04485b466b1803b509d7114c6dd267ad4",
+      "status": "pass",
+      "width": 699,
+      "height": 285.4609375
+    },
+    {
+      "id": "07-source-review-and-recovery#2",
+      "digest": "sha256:dabc1a18cda553166615ed68b1707e2a3554b6c172c3d12a259a027a4bb386cc",
+      "status": "pass",
+      "width": 612.421875,
+      "height": 428.3984375
+    },
+    {
+      "id": "08-evidence-knowledge-calls#1",
+      "digest": "sha256:216a9289340d04e7d917d19556bac22e8c4acfefaa767ac0c0f1969fc975d630",
+      "status": "pass",
+      "width": 491.203125,
+      "height": 428.390625
+    },
+    {
+      "id": "08-evidence-knowledge-calls#2",
+      "digest": "sha256:95d1f0db5a9b13e1b32466d7ab34e3a8a916d4e64d626a2bd66db04e85d5c425",
+      "status": "pass",
+      "width": 699,
+      "height": 198.859375
+    },
+    {
+      "id": "08-evidence-knowledge-calls#3",
+      "digest": "sha256:8ed8e329edca4a95579cc7373303cc803f57b435e27640dd0525c672ecc76a72",
+      "status": "pass",
+      "width": 372.328125,
+      "height": 650
+    },
+    {
+      "id": "08-failure-and-receipts#1",
+      "digest": "sha256:f688c11d77ddda809681802510999df11f6f92d3e651444c172b26aa6459e2e7",
+      "status": "pass",
+      "width": 623.328125,
+      "height": 346.9921875
+    },
+    {
+      "id": "08-evidence-knowledge-imports#1",
+      "digest": "sha256:2786df76b92893aec40973e1ee579efcae50b9f8708206256165e648641d3454",
+      "status": "pass",
+      "width": 699,
+      "height": 340.5859375
+    },
+    {
+      "id": "08-evidence-knowledge-imports#2",
+      "digest": "sha256:8da5cbc56792f04aa41a29b67e478ed4bd83066684a37b9deca59016865390e6",
+      "status": "pass",
+      "width": 610.0390625,
+      "height": 349.9921875
+    },
+    {
+      "id": "08-evidence-knowledge-overview#1",
+      "digest": "sha256:491cf41962739663d30940778610fa86bb7bc79460b750ab38927aa3f2603ad2",
+      "status": "pass",
+      "width": 448.421875,
+      "height": 365.3984375
+    },
+    {
+      "id": "09-domain-runs-calls#1",
+      "digest": "sha256:d170e7aab3c8f03aa27ba01ef74be99a01478b5b5262a61fc3fb55e3f5008eca",
+      "status": "pass",
+      "width": 699,
+      "height": 284.453125
+    },
+    {
+      "id": "09-domain-runs-calls#2",
+      "digest": "sha256:067b260e8f2a9ca3c9da87d4b559bf0d1e428a9f1d80e33579b4eed7c12fcdf9",
+      "status": "pass",
+      "width": 699,
+      "height": 235.8046875
+    },
+    {
+      "id": "09-domain-runs-imports#1",
+      "digest": "sha256:6676828cf791043cb4bed5ddc5be229130b404cf62b7f638461204c49c48ce7a",
+      "status": "pass",
+      "width": 699,
+      "height": 183.546875
+    },
+    {
+      "id": "09-domain-runs-imports#2",
+      "digest": "sha256:6ca6691e7f8ae1ebfd623d4fff0702a659d430cd4e994ce9fe927312426f613e",
+      "status": "pass",
+      "width": 699,
+      "height": 188.1875
+    },
+    {
+      "id": "09-domain-runs-overview#1",
+      "digest": "sha256:50e2ef0f08aa5331279ec01f5aece613da8fb6e450efc90b102e03ffdf396225",
+      "status": "pass",
+      "width": 699,
+      "height": 211.578125
+    },
+    {
+      "id": "10-authority-boundaries#1",
+      "digest": "sha256:3500e093698e76dcc540023ddd2303c04e7610ac0cbd808672751b4694f764a4",
+      "status": "pass",
+      "width": 699,
+      "height": 185.984375
+    },
+    {
+      "id": "10-strict-production-calls#1",
+      "digest": "sha256:34bdffd5affcd42389be018bc647f3dab1af2aa3fc7ea47083335ee5e8ad0094",
+      "status": "pass",
+      "width": 699,
+      "height": 184.4296875
+    },
+    {
+      "id": "10-strict-production-calls#2",
+      "digest": "sha256:89e2fcddd9467878b35f6e9bd14f6bd88771b24e24abd39d987097bfce234ce3",
+      "status": "pass",
+      "width": 699,
+      "height": 137.1328125
+    },
+    {
+      "id": "10-strict-production-imports#1",
+      "digest": "sha256:786bce32c14c78cb3fea70019e7981bb71b3f18e43d182d06a5e54de22bd9fdc",
+      "status": "pass",
+      "width": 699,
+      "height": 160.0234375
+    },
+    {
+      "id": "10-strict-production-imports#2",
+      "digest": "sha256:5b1f5f4dc870653a6372a3ece30092f3c98ed5c06cd5360df25166ee50fd6fdb",
+      "status": "pass",
+      "width": 523.4296875,
+      "height": 349.9921875
+    },
+    {
+      "id": "10-strict-production-overview#1",
+      "digest": "sha256:1005293ebba108a218de1bc316380dae0cc39dfc34aa890e4300678a0eba1d63",
+      "status": "pass",
+      "width": 699,
+      "height": 227.234375
+    },
+    {
+      "id": "11-observability-calls#1",
+      "digest": "sha256:cb3eab1ca3c066fea957152d715a4d7a7be6a29b31906279c1a9209960d78b61",
+      "status": "pass",
+      "width": 699,
+      "height": 210.6171875
+    },
+    {
+      "id": "11-observability-calls#2",
+      "digest": "sha256:ecbe5c35597958568e7d6bbbee3ac70586e1e07c908543f8eaa088a57fa90a7d",
+      "status": "pass",
+      "width": 699,
+      "height": 228.34375
+    },
+    {
+      "id": "11-observability-calls#3",
+      "digest": "sha256:9e3a2ee4bd3ce39a2d6708b807283dfdffcc9e0a9d33bb85c3871b047505d5bd",
+      "status": "pass",
+      "width": 289,
+      "height": 262.8984375
+    },
+    {
+      "id": "11-detector-failure-boundaries#1",
+      "digest": "sha256:b22adeb703974dd63911ac38c9902f8a026db2dc8b025cf2aa93503dd57ebfb9",
+      "status": "pass",
+      "width": 381.53125,
+      "height": 650
+    },
+    {
+      "id": "11-detector-failure-boundaries#2",
+      "digest": "sha256:9e2f540200be82ff566af1ca5351d97a5f85bfa76ba254333d326a5edbbb19f4",
+      "status": "pass",
+      "width": 388.640625,
+      "height": 599.5
+    },
+    {
+      "id": "11-observability-imports#1",
+      "digest": "sha256:d2b8fb106247486eefd1615bbd8d29eb8d28bfdcd0a9232a631e90da29985694",
+      "status": "pass",
+      "width": 687.6171875,
+      "height": 205.4921875
+    },
+    {
+      "id": "11-observability-imports#2",
+      "digest": "sha256:6ed3efafbe0bf4458e238b182d64c8d40031ee2f63ef7b72bdd1d7f86975cce6",
+      "status": "pass",
+      "width": 573.6171875,
+      "height": 349.9921875
+    },
+    {
+      "id": "11-observability-imports#3",
+      "digest": "sha256:0e610952534b131778d72303d05b4a185e16b50228e66867ef652de32c170663",
+      "status": "pass",
+      "width": 560.390625,
+      "height": 350
+    },
+    {
+      "id": "11-observability-overview#1",
+      "digest": "sha256:4dc50ce1c8ba0a8dfa986cbb8a8edd186b13de1bba26f45104216ac14b230f7d",
+      "status": "pass",
+      "width": 616.328125,
+      "height": 380.796875
+    },
+    {
+      "id": "11-source-policy-and-channels#1",
+      "digest": "sha256:8293a79012e68ddd7076e8b705761a7acb66934cbe8c587d6c97afa9b397d5be",
+      "status": "pass",
+      "width": 627.09375,
+      "height": 609.296875
+    },
+    {
+      "id": "12-build-contracts-calls#1",
+      "digest": "sha256:fc751e6821121905dbea269f3da7fbc2ed41c30b98c06b9ecd1052596d613f11",
+      "status": "pass",
+      "width": 699,
+      "height": 286.25
+    },
+    {
+      "id": "12-build-contracts-calls#2",
+      "digest": "sha256:fa98ba83e1c147434ed41880cb54bafbd09f4b928b1a51d093bb7f7cb0730e0b",
+      "status": "pass",
+      "width": 524.6328125,
+      "height": 491.390625
+    },
+    {
+      "id": "12-build-contracts-imports#1",
+      "digest": "sha256:50b9375d637de6951b6ef1f8a5f7995e78aabe73736dbe48554edbe444123d1c",
+      "status": "pass",
+      "width": 552,
+      "height": 247.5
+    },
+    {
+      "id": "12-build-contracts-overview#1",
+      "digest": "sha256:7d6f94fe95fabed655ada677ddb0d087f1e23a6cc94d1f45cbb898a1d98f2d15",
+      "status": "pass",
+      "width": 699,
+      "height": 151.7734375
+    },
+    {
+      "id": "13-end-to-end-calls#1",
+      "digest": "sha256:212e0ff5b535015ec1e88dd4e281d9f3cd553fe4115b87387deae66281f3154c",
+      "status": "pass",
+      "width": 654.21875,
+      "height": 428.390625
+    },
+    {
+      "id": "13-end-to-end-calls#2",
+      "digest": "sha256:5f78a182053cd2bd909ebeac12676e884dbbf43d04960894949e9456930d485d",
+      "status": "pass",
+      "width": 671.40625,
+      "height": 428.3984375
+    },
+    {
+      "id": "13-complete-sequence#1",
+      "digest": "sha256:8d181b0d0f19ac8416dadcb9db27529327ea19a163b418a317f2eb5634a85aaa",
+      "status": "pass",
+      "width": 699,
+      "height": 493.7734375
+    },
+    {
+      "id": "13-end-to-end-imports#1",
+      "digest": "sha256:a20dd6a0ec23913b17587cf63749d2df7954232e2a69c528b9924019fe59bf5f",
+      "status": "pass",
+      "width": 576.5703125,
+      "height": 350
+    },
+    {
+      "id": "13-end-to-end-imports#2",
+      "digest": "sha256:86971939b36c347cccede6967c97ba4d0bebca0535c9e1ad71ba5b66ada9a511",
+      "status": "pass",
+      "width": 615.4375,
+      "height": 350
+    },
+    {
+      "id": "13-knowledge-production#1",
+      "digest": "sha256:d61daaa192d5d834ff8d9bd64e4a0b597d445d347a9993317429bb87a7b6b0e8",
+      "status": "pass",
+      "width": 699,
+      "height": 346.71875
+    },
+    {
+      "id": "13-knowledge-production#2",
+      "digest": "sha256:f1ecd289aa95076c0cf9a0e5146916c3891042223625424c40b2b90dadb51268",
+      "status": "pass",
+      "width": 699,
+      "height": 367.9453125
+    },
+    {
+      "id": "13-end-to-end-overview#1",
+      "digest": "sha256:cc8519ae8a8adbd0021ec70d276f13741bfb261bd63b3348e59f766fa9a83b11",
+      "status": "pass",
+      "width": 486.140625,
+      "height": 380.796875
+    },
+    {
+      "id": "13-receipt-and-recovery#1",
+      "digest": "sha256:c4a97c5f8575d87cffda9c3ed40f9dfe51ee0e07ffae959682d951956d725043",
+      "status": "pass",
+      "width": 649.234375,
+      "height": 247.5
+    },
+    {
+      "id": "13-receipt-and-recovery#2",
+      "digest": "sha256:c45eb5ff1018186c413dffb0d1847a3df14107e4888f88232b28b2e222907890",
+      "status": "pass",
+      "width": 435.921875,
+      "height": 247.5
+    }
+  ]
+}

@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 1,
+  "meaning": "Only navigation and relation identifiers; scenario behavior remains in referenced Markdown.",
+  "scenarios": [
+    {
+      "id": "observer-failure",
+      "title": "工具有回执，但观察回程失败",
+      "docId": "03-runtime-failure-deep-review",
+      "anchor": "scenario-observer-failure",
+      "symptoms": [
+        "工具已完成",
+        "tracker/trace 异常",
+        "不得重复副作用"
+      ],
+      "diagnostics": [
+        "TOOL_POSTPROCESSING_FAILED"
+      ],
+      "edgeIds": [
+        "E-V4R-05",
+        "E-V4R-07"
+      ]
+    },
+    {
+      "id": "cancel-timeout",
+      "title": "取消或超时后，哪些部分结果可信",
+      "docId": "03-state-and-recovery",
+      "anchor": "scenario-cancel-timeout",
+      "symptoms": [
+        "cancel",
+        "timeout",
+        "partial",
+        "确认回执",
+        "停止不回滚"
+      ],
+      "diagnostics": [
+        "abort_signal",
+        "timeout"
+      ],
+      "edgeIds": [
+        "E-STATE-05"
+      ]
+    },
+    {
+      "id": "host-failure",
+      "title": "HOST 错误发生在执行前，还是返回后",
+      "docId": "03-runtime-failure-deep-review",
+      "anchor": "scenario-host-failure",
+      "symptoms": [
+        "宿主异常",
+        "投影失败",
+        "未知副作用"
+      ],
+      "diagnostics": [
+        "TOOL_HOST_EXECUTION_FAILED",
+        "TOOL_REQUEST_ASSEMBLY_FAILED"
+      ],
+      "edgeIds": [
+        "E-V4R-20",
+        "E-V4R-21"
+      ]
+    },
+    {
+      "id": "created-not-ready",
+      "title": "已创建候选，但 readiness 尚未就绪",
+      "docId": "13-knowledge-production",
+      "anchor": "scenario-created-not-ready",
+      "symptoms": [
+        "created",
+        "pending",
+        "ready:false",
+        "先保留 id"
+      ],
+      "diagnostics": [
+        "retrieval.profile.missing"
+      ],
+      "edgeIds": [
+        "E-KFLOW-18",
+        "E-KFLOW-19"
+      ]
+    },
+    {
+      "id": "scope-release",
+      "title": "运行结束了，scope 由谁释放",
+      "docId": "03-runtime-failure-deep-review",
+      "anchor": "scenario-scope-release",
+      "symptoms": [
+        "releaseScope",
+        "清理失败",
+        "迟到 loop",
+        "pending"
+      ],
+      "diagnostics": [
+        "run closed"
+      ],
+      "edgeIds": [
+        "E-V4R-13",
+        "E-V4R-27"
+      ]
+    },
+    {
+      "id": "source-policy",
+      "title": "相同内容为何在台账与事件中不同",
+      "docId": "11-source-policy-and-channels",
+      "anchor": "scenario-source-policy",
+      "symptoms": [
+        "T3",
+        "terminal",
+        "secret-bearing",
+        "开发者事件",
+        "见证"
+      ],
+      "diagnostics": [
+        "source.path",
+        "unknown-source",
+        "no-span",
+        "covered",
+        "merged"
+      ],
+      "edgeIds": [
+        "E-SOURCE-01",
+        "E-SOURCE-03",
+        "E-SOURCE-04",
+        "E-SOURCE-05"
+      ]
+    }
+  ],
+  "relationKinds": {
+    "13-complete-sequence/E-SLICE-01": "call",
+    "13-complete-sequence/E-SLICE-04": "call",
+    "13-complete-sequence/E-SLICE-05": "call",
+    "13-complete-sequence/E-SLICE-06": "call",
+    "13-complete-sequence/E-SLICE-07": "call",
+    "13-complete-sequence/E-SLICE-08": "call",
+    "13-complete-sequence/E-SLICE-09": "call",
+    "13-complete-sequence/E-SLICE-10": "call",
+    "13-complete-sequence/E-SLICE-15": "call",
+    "13-complete-sequence/E-SLICE-02": "ownership",
+    "13-complete-sequence/E-SLICE-03": "data-flow",
+    "13-complete-sequence/E-SLICE-11": "data-flow",
+    "13-complete-sequence/E-SLICE-12": "data-flow",
+    "13-complete-sequence/E-SLICE-13": "data-flow",
+    "13-complete-sequence/E-SLICE-14": "data-flow",
+    "13-complete-sequence/E-SLICE-16": "data-flow",
+    "13-complete-sequence/E-SLICE-17": "data-flow",
+    "13-complete-sequence/E-SLICE-18": "data-flow",
+    "13-knowledge-production/E-KFLOW-01": "call",
+    "13-knowledge-production/E-KFLOW-02": "call",
+    "13-knowledge-production/E-KFLOW-03": "call",
+    "13-knowledge-production/E-KFLOW-04": "call",
+    "13-knowledge-production/E-KFLOW-05": "call",
+    "13-knowledge-production/E-KFLOW-07": "call",
+    "13-knowledge-production/E-KFLOW-09": "call",
+    "13-knowledge-production/E-KFLOW-10": "call",
+    "13-knowledge-production/E-KFLOW-13": "ownership",
+    "13-knowledge-production/E-KFLOW-14": "call",
+    "13-knowledge-production/E-KFLOW-15": "call",
+    "13-knowledge-production/E-KFLOW-16": "call",
+    "13-knowledge-production/E-KFLOW-18": "call",
+    "13-knowledge-production/E-KFLOW-22": "call",
+    "13-knowledge-production/E-KFLOW-06": "data-flow",
+    "13-knowledge-production/E-KFLOW-08": "data-flow",
+    "13-knowledge-production/E-KFLOW-11": "data-flow",
+    "13-knowledge-production/E-KFLOW-12": "call",
+    "13-knowledge-production/E-KFLOW-17": "data-flow",
+    "13-knowledge-production/E-KFLOW-19": "data-flow",
+    "13-knowledge-production/E-KFLOW-20": "data-flow",
+    "13-knowledge-production/E-KFLOW-21": "data-flow",
+    "13-knowledge-production/E-KFLOW-23": "data-flow",
+    "13-knowledge-production/E-KFLOW-24": "data-flow",
+    "03-runtime-failure-deep-review/E-V4R-13": "ownership",
+    "03-runtime-failure-deep-review/E-V4R-27": "ownership"
+  }
+}

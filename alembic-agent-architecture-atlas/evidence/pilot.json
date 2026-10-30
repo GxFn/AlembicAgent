@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-30T21:08:23.279Z",
+  "status": "pass",
+  "command": "npm run test:pilot",
+  "baselineCommit": "a2edf10bff82d4ee36109dc7a394881e858cdcb4",
+  "sourcePatterns": [
+    "src/**/*.ts",
+    "package.json",
+    "tsconfig.json"
+  ],
+  "sourceFingerprint": "sha256:cb83d099458e1ecd90c29d210dbe05c10d5ed0d6bf044b8f5a8b2daec4bfa98d",
+  "testFingerprint": "sha256:f425bccc8da62339ebd0bef210b860cb48e40be0b6a51101208d39426ef5ea14",
+  "harnessPatterns": [
+    "test/pilot.test.ts",
+    "vitest.config.ts",
+    "package.json",
+    "package-lock.json",
+    "scripts/atlas-lib.mjs",
+    "scripts/snapshot-store.mjs",
+    "scripts/maintenance.mjs",
+    "scripts/evidence.mjs",
+    "scripts/relations.mjs",
+    "scripts/public-entrypoints.mjs",
+    "scripts/render-contract.mjs",
+    "scripts/render-state.mjs",
+    "metadata.schema.json"
+  ],
+  "harnessFingerprint": "sha256:4aebafb09e068ca7fd67a7676d2d09938b216ad459ecdf2bc861c42c3d944962",
+  "inputStableDuringRun": true,
+  "executionEnvironment": {
+    "node": "v24.19.0",
+    "platform": "darwin",
+    "arch": "arm64"
+  },
+  "real": [
+    "AgentService",
+    "AgentProfileCompiler",
+    "AgentRuntimeBuilder",
+    "SingleStrategy",
+    "AgentRuntime",
+    "ToolExecutionPipeline",
+    "ToolRouterAdapter",
+    "ToolRouter",
+    "code.read"
+  ],
+  "controlled": [
+    "scripted AI provider",
+    "temporary filesystem",
+    "host context factory"
+  ],
+  "unverified": [
+    "live provider/network",
+    "external host entrypoint",
+    "Core durable persistence",
+    "terminal sandbox",
+    "knowledge publication",
+    "all product tests"
+  ],
+  "scenarios": [
+    {
+      "id": "success",
+      "status": "pass",
+      "fullName": "一次请求到工具回执：真实组合样板 > success: receipt is returned to the second model turn and projected by Service",
+      "serviceStatus": "success",
+      "toolStatuses": [
+        "success"
+      ],
+      "toolReceipts": 1,
+      "routerDispatches": 1,
+      "assertion": "真实读取→信封→下一轮模型输入→Service.toolCalls，内容与不可信标记保留。"
+    },
+    {
+      "id": "denied",
+      "status": "pass",
+      "fullName": "一次请求到工具回执：真实组合样板 > denied: an unadvertised tool never reaches the host router",
+      "serviceStatus": "success",
+      "toolStatuses": [
+        "pipeline-result"
+      ],
+      "toolReceipts": 1,
+      "routerDispatches": 0,
+      "assertion": "不在阶段白名单的 terminal 在管线短路；工具拒绝与整次 Service 状态分别记录。"
+    },
+    {
+      "id": "cancel-before",
+      "status": "pass",
+      "fullName": "一次请求到工具回执：真实组合样板 > cancel-before: preflight cancellation skips builder, model and router",
+      "serviceStatus": "aborted",
+      "toolStatuses": [],
+      "toolReceipts": 0,
+      "routerDispatches": 0,
+      "assertion": "Service 预检取消，没有创建 Runtime 或分配宿主工具上下文。"
+    },
+    {
+      "id": "cancel-after",
+      "status": "pass",
+      "fullName": "一次请求到工具回执：真实组合样板 > cancel-after: confirmed receipt survives interruption before the next turn",
+      "serviceStatus": "aborted",
+      "toolStatuses": [
+        "success"
+      ],
+      "toolReceipts": 1,
+      "routerDispatches": 1,
+      "assertion": "回执已确认后取消，保留该回执且不再调用模型；不推导外部副作用回滚。"
+    },
+    {
+      "id": "timeout",
+      "status": "pass",
+      "fullName": "一次请求到工具回执：真实组合样板 > timeout: owned deadline returns a timeout without fabricating a receipt",
+      "serviceStatus": "timeout",
+      "toolStatuses": [],
+      "toolReceipts": 0,
+      "routerDispatches": 0,
+      "assertion": "模型端口挂起时由运行边界截止；返回 timeout，零工具回执。"
+    },
+    {
+      "id": "partial",
+      "status": "pass",
+      "fullName": "一次请求到工具回执：真实组合样板 > partial: one missing file preserves the successful read in a partial envelope",
+      "serviceStatus": "success",
+      "toolStatuses": [
+        "partial"
+      ],
+      "toolReceipts": 1,
+      "routerDispatches": 1,
+      "assertion": "批量读取一成一败保留成功内容与 partial，不把最终模型回复成功解释为所有工具成功。"
+    }
+  ]
+}

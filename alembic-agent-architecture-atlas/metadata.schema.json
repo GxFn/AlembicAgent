@@ -1,0 +1,133 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "diagramId",
+    "topic",
+    "title",
+    "viewType",
+    "truthKind",
+    "reviewDepth",
+    "verifiedAt",
+    "baselineCommit",
+    "documentationOwner",
+    "sourcePaths",
+    "testPaths",
+    "contractPaths",
+    "refreshTriggers",
+    "sourceFingerprint",
+    "testEvidence"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "diagramId": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]+$"
+    },
+    "topic": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "viewType": {
+      "enum": [
+        "guide",
+        "architecture",
+        "file-dependency",
+        "call-flow",
+        "state",
+        "recovery",
+        "evidence",
+        "vertical-slice"
+      ]
+    },
+    "truthKind": {
+      "enum": [
+        "current-code",
+        "in-progress-worktree",
+        "stale",
+        "historical",
+        "target-design"
+      ]
+    },
+    "reviewDepth": {
+      "enum": [
+        "L0",
+        "L1",
+        "L2",
+        "L3",
+        "L4",
+        "L5"
+      ]
+    },
+    "verifiedAt": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "baselineCommit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "documentationOwner": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sourcePaths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "testPaths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "contractPaths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "refreshTriggers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "sourceFingerprint": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "testEvidence": {
+      "const": "anchored"
+    },
+    "externalContracts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "reviewRecord": {
+      "type": "string"
+    },
+    "generatedBy": {
+      "enum": [
+        "manual-review",
+        "mixed",
+        "AST"
+      ]
+    }
+  }
+}

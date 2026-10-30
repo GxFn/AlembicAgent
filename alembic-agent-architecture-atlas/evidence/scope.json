@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-22T11:06:27.696Z",
+  "agentWriteScope": "alembic-agent-architecture-atlas/",
+  "readOnlyInputs": [
+    "src/",
+    "test/",
+    "scripts/",
+    "config/",
+    "package.json",
+    "package-lock.json",
+    "tsconfig.json"
+  ],
+  "entryCommit": "34c62eda7082732e7a6e8bc45fec4e2121c9653e",
+  "exitCommit": "34c62eda7082732e7a6e8bc45fec4e2121c9653e",
+  "entryFilesCompared": 562,
+  "productChangesObservedDuringTask": [
+    "config/agent-public-api-signatures.json",
+    "src/agent/prompts/insightAnalyst.ts",
+    "src/agent/runtime/AgentRuntime.ts",
+    "src/tools/kernel/manifest.ts",
+    "src/tools/runtime/handlers/searchCacheGeneration.ts",
+    "src/tools/runtime/handlers/terminal.ts",
+    "src/tools/runtime/toolsets/Conversation.ts",
+    "test/agent-lifecycle.test.ts",
+    "test/memory-context.test.ts",
+    "test/memory-coordinator-cache-proxy.test.ts",
+    "test/memory-session-store-lazy-cleanup.test.ts",
+    "test/runtime-degrade-diagnostics.test.ts",
+    "test/runtime-efficiency.test.ts",
+    "test/tool-pipeline-dead-links.test.ts",
+    "src/agent/utils/redaction/detectors.ts",
+    "test/redaction-detectors.test.ts"
+  ],
+  "interpretation": "Product working tree already had changes and continued changing during early reading. These paths are retained, not attributed to atlas work; the agent only wrote the independent atlas and temporary test fixtures. Docs and pilot bind the reviewed current bytes. This report does not claim every product file equals the entry baseline.",
+  "neighborRepositoriesWritten": false,
+  "rootBuildOrPackageWiringChanged": false,
+  "noCommitReason": "User requested implementation while preserving existing changes; no commit, push or publication was requested."
+}

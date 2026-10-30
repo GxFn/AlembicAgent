@@ -1,0 +1,330 @@
+{
+  "schemaVersion": 2,
+  "checkedAt": "2026-10-23T13:59:22.241Z",
+  "status": "pass",
+  "scope": "AlembicAgent independent architecture atlas only; controlled test interpretation is not production or Core acceptance.",
+  "milestones": {
+    "V5": "Current baseline calibrated; new immutable v5 snapshot",
+    "V6": "Execution identity, reading provenance, result manifests, per-page/edge relations and incremental maintenance",
+    "V7": "Six symptom entries, three source-reading paths, stable fragments, evidence drawer, host route and responsive reader"
+  },
+  "snapshot": {
+    "id": "agent-atlas-2026-10-23-v5",
+    "schemaVersion": 2,
+    "integrity": {
+      "algorithm": "sha256-canonical-json-v1",
+      "digest": "sha256:b1cf862d1b2397de9570b8b40b342a50ed4ca8d6819162dbeba808164a544216"
+    },
+    "oldSnapshotsPreserved": 5
+  },
+  "content": {
+    "topics": 13,
+    "documents": 58,
+    "diagrams": 94,
+    "sourceFiles": 290,
+    "reviewedChangedOrAdded": 114,
+    "retainedUnchangedSource": 176,
+    "retiredSource": 4,
+    "reading": {
+      "full": 237,
+      "partial": 53,
+      "indexed": 0
+    },
+    "claims": 440,
+    "scenarios": 6,
+    "unresolvedLoads": 27
+  },
+  "verification": {
+    "commands": [
+      {
+        "command": "npm run check",
+        "status": "pass",
+        "nodeTests": 38,
+        "vitestTests": 17,
+        "meaning": "38 Node checks, 7 reader, 4 loader, 6 real combination pilot scenarios; typecheck, lint, current, render and build all passed."
+      },
+      {
+        "command": "npm run test:scoped -- --resume",
+        "status": "pass",
+        "groups": 100,
+        "passed": 1072,
+        "failed": 0,
+        "inputMatched": true,
+        "meaning": "Actual final collection, not count of selector templates or filtered skipped cases."
+      },
+      {
+        "command": "npm run test:scoped -- --resume (unchanged inputs)",
+        "status": "pass",
+        "reusedGroups": 100,
+        "reexecutedGroups": 0
+      },
+      {
+        "command": "npm run snapshot -- --id agent-atlas-2026-10-23-v5",
+        "status": "pass"
+      },
+      {
+        "command": "npm run build + npm run check:current after snapshot",
+        "status": "pass"
+      },
+      {
+        "command": "node scripts/report-bundle.mjs",
+        "status": "pass"
+      },
+      {
+        "command": "git diff --check",
+        "status": "pass"
+      }
+    ],
+    "currentDocumentErrors": [],
+    "pilot": "matched",
+    "render": "matched",
+    "actualBrowserRender": {
+      "diagrams": 94,
+      "rendererVersion": "12.2.0",
+      "checkedAt": "2026-10-23T13:27:32.145Z"
+    },
+    "browser": {
+      "scenarios": 6,
+      "sourceTasks": 3,
+      "stableFragments": true,
+      "legacyIsolation": true,
+      "newSnapshotLoaded": true,
+      "selectedEdge": {
+        "assertions": 1,
+        "claims": [
+          "E-KFLOW-18"
+        ],
+        "groups": [
+          "current-mining-e2e-pipeline"
+        ],
+        "hasCollection": true
+      },
+      "viewports": [
+        {
+          "width": 1440,
+          "height": 1000,
+          "role": "desktop source and maintenance view"
+        },
+        {
+          "width": 390,
+          "height": 844,
+          "overflow": false,
+          "role": "scenario and T3 detail navigation"
+        }
+      ],
+      "record": {
+        "schemaVersion": 1,
+        "checkedAt": "2026-10-23T13:51:32.355Z",
+        "scenarios": [
+          {
+            "errors": 0,
+            "heading": "Runtime、工具后处理与缓存：逐文件深读",
+            "id": "scenario-observer-failure",
+            "present": true,
+            "top": 90.2109375
+          },
+          {
+            "errors": 0,
+            "heading": "运行状态、取消与恢复",
+            "id": "scenario-cancel-timeout",
+            "present": true,
+            "top": 89.9375
+          },
+          {
+            "errors": 0,
+            "heading": "Runtime、工具后处理与缓存：逐文件深读",
+            "id": "scenario-host-failure",
+            "present": true,
+            "top": 90.09375
+          },
+          {
+            "errors": 0,
+            "heading": "从分析发现到知识候选回执",
+            "id": "scenario-created-not-ready",
+            "present": true,
+            "top": 89.9609375
+          },
+          {
+            "errors": 0,
+            "heading": "Runtime、工具后处理与缓存：逐文件深读",
+            "id": "scenario-scope-release",
+            "present": true,
+            "top": 89.9296875
+          },
+          {
+            "errors": 0,
+            "heading": "来源策略与三条内容通道",
+            "id": "scenario-source-policy",
+            "present": true,
+            "top": 90.1484375
+          }
+        ],
+        "files": [
+          {
+            "file": "src/agent/runtime/AgentRuntime.ts",
+            "behavior": true,
+            "risks": true,
+            "tests": 8
+          },
+          {
+            "behavior": true,
+            "file": "src/agent/memory/SessionStore.ts",
+            "risks": true,
+            "tests": 4
+          },
+          {
+            "behavior": true,
+            "file": "src/agent/utils/redaction/sourcePolicy.ts",
+            "risks": true,
+            "tests": 7
+          }
+        ],
+        "history": {
+          "scenarios": "架构图谱\n/\n故障阅读路线\n从症状走到责任与证据。\n\n入口只索引正文；副作用、重试前提和恢复责任以所选版本的原文为准。\n\n这个历史版本没有故障索引；请使用该版本原有专题，不会显示当前场景。",
+          "health": "来源与维护\n\n该历史版本未封存维护报告；不会套用今天的源码状态。"
+        },
+        "crossDocumentFragment": {
+          "href": "#/doc/11-source-policy-and-channels?section=scenario-source-policy",
+          "headings": [
+            "来源策略与三条内容通道",
+            "内容进入哪条通道",
+            "来源矩阵"
+          ],
+          "scrollWidth": 375,
+          "targetTop": 89.84375,
+          "width": 390
+        },
+        "search": {
+          "href": "#/doc/03-runtime-failure-deep-review?section=s-%E5%9C%BA%E6%99%AF-%E5%AE%BF%E4%B8%BB%E6%8B%92%E7%BB%9D-%E5%BC%82%E5%B8%B8%E6%88%96%E8%BF%94%E5%9B%9E%E5%90%8E%E6%8A%95%E5%BD%B1%E5%A4%B1%E8%B4%A5-17u04g6",
+          "snippet": " TOOL_REQUEST_ASSEMBLY_FAILED表示尚未发出；TOOL_HOST_EXECUTION_FAILED来自包含execute、清理、诊断与投影的共同try，单凭这个码不能证明宿主尚未返回。先看metadata.envelope、callId和确认历史；未确认副作用由宿主读回后决定恢复。 test/runtime-degrade-diag"
+        },
+        "viewports": [
+          {
+            "width": 1440,
+            "height": 1000,
+            "role": "desktop source and maintenance view"
+          },
+          {
+            "width": 390,
+            "height": 844,
+            "overflow": false,
+            "role": "scenario and T3 detail navigation"
+          }
+        ],
+        "screenshots": [
+          "scenarios-v7-1440.png",
+          "health-v7-1440.png",
+          "source-scenario-v7-390.png"
+        ],
+        "meaning": "Real browser observations of the local Atlas; source review and product execution are separately recorded.",
+        "selectedEdge": {
+          "edge": "E-KFLOW-18",
+          "panel": "READING EVIDENCE\n↗\n这页的依据\n来源身份\n工作树实况\n\n当前源码含未提交改动；文档按所读工作树描述。\n\n37bdc7f7b6dc\n源码指纹\n输入一致\n\n2026/10/23 06:53 采样\n页面不是实时仓库监控。\n\n35 个输入 · L4 阅读\n图形渲染 · 最近成功\n最近尝试通过\n2 / 2\n\n图源摘要与 Mermaid 12.2.0 匹配。\n渲染通过不代表运行行为通过。\n\nE-KFLOW-18 · 精确断言\n1 次定向执行通过\n\n1 条断言定位，0 个精确样板场景；0 条尚无精确执行绑定。\n只证明对应断言，不能推出本页全部行为已覆盖。\n\n查看采集身份与命令 →\n\n回到整页证据\n\n结论与图边 1\n本页导航\n1. 分析：请求到可引用发现\n2. 生产：分析工件到候选回执\n必须成立的装配\n数据怎样跨阶段保留下来\n健康 case 的实际断言\n分支选择与未跨过的边界\n场景：创建确认，但尚未可用\n证据原文、来源分类与持久化边界\n输入文件 35",
+          "proof": {
+            "assertions": 1,
+            "claims": [
+              "E-KFLOW-18"
+            ],
+            "groups": [
+              "current-mining-e2e-pipeline"
+            ],
+            "hasCollection": true
+          }
+        },
+        "sealedVersion": {
+          "id": "agent-atlas-2026-10-23-v5",
+          "loaded": true,
+          "scenarioCount": 6,
+          "evidence": "READING EVIDENCE\n↗\n这页的依据\n来源身份\n历史快照\n\n历史采样不代表今日源码状态。\n\n37bdc7f7b6dc\n源码指纹\n历史时点\n\n2026/10/23 06:55 采样\n页面不是实时仓库监控。\n\n35 个输入 · L4 阅读\n图形渲染 · 最近成功\n历史渲染记录\n2 / 2\n\n图源摘要与 历史 Mermaid 12.2.0 匹配。\n渲染通过不代表运行行为通过。\n\nE-KFLOW-18 · 精确断言\n历史 · 1 次定向执行通过\n\n1 条断言定位，0 个精确样板场景；0 条尚无精确执行绑定。\n只证明对应断言，不能推出本页全部行为已覆盖。\n\n查看采集身份与命令 →\n\n回到整页证据\n\n结论与图边 1\n本页导航\n1. 分析：请求到可引用发现\n2. 生产：分析工件到候选回执\n必须成立的装配\n数据怎样跨阶段保留下来\n健康 case 的实际断言\n分支选择与未跨过的边界\n场景：创建确认，但尚未可用\n证据原文、来源分类与持久化边界\n输入文件 35"
+        }
+      },
+      "screenshots": [
+        "evidence/ui/scenarios-v7-1440.png",
+        "evidence/ui/health-v7-1440.png",
+        "evidence/ui/source-scenario-v7-390.png"
+      ]
+    },
+    "implementationReview": {
+      "schemaVersion": 1,
+      "reviewedAt": "2026-10-23T13:46:41.671Z",
+      "scope": "Independent Atlas maintenance and reader code only",
+      "findings": [
+        {
+          "id": "shared-test-inputs",
+          "severity": "P1",
+          "status": "resolved",
+          "change": "Conservative groups bind all test/helpers/fixtures, repository docs/scripts/config and the selected file; selected pure redaction groups declare reviewed dependencies.",
+          "files": [
+            "scripts/run-scoped.mjs",
+            "evidence/execution-plan.json"
+          ]
+        },
+        {
+          "id": "same-line-assertion",
+          "severity": "P1",
+          "status": "resolved",
+          "change": "Bindings require matching source inputs, literal title or a unique parameterized registration location with column; same-line declarations cannot borrow another result.",
+          "test": "test/relations.test.mjs: two declarations on one line cannot lend one passing result to the other"
+        },
+        {
+          "id": "parameter-registration",
+          "severity": "P2",
+          "status": "resolved",
+          "change": "AST records the actual each registration call site separately from the table start; fresh execution collection carries that site.",
+          "test": "test/relations.test.mjs: parameterized cases use the real registration call site, not the each table start"
+        },
+        {
+          "id": "failed-finalization",
+          "severity": "P2",
+          "status": "resolved",
+          "change": "Failure finalization recomputes result digest/counts and persists normalized result; unavailable after-input is explicit null and cannot pass.",
+          "test": "test/maintenance.test.mjs: an interrupted after-input observation remains a valid failed report, never a passing one"
+        },
+        {
+          "id": "reading-depth-upgrade",
+          "severity": "P2",
+          "status": "resolved",
+          "change": "Reading claims cannot exceed the review proof depth; delta provenance must match the exact previous hash.",
+          "test": "test/maintenance.test.mjs: review proof cannot be upgraded from partial to full by editing the reading claim"
+        },
+        {
+          "id": "duplicate-headings",
+          "severity": "P2",
+          "status": "resolved",
+          "change": "Reader anchors use parent heading paths and occurrence distinction; search preserves diagnostic underscores and prioritizes scenario prose.",
+          "test": "test/reader.test.ts: duplicate subheadings resolve under their own parent and diagnostic underscores survive snippets"
+        }
+      ],
+      "executionMeaning": "Final test and browser outcomes are recorded in iterations/v5-v7-validation.json; this is the review-resolution record, not a separate product acceptance."
+    }
+  },
+  "transitions": {
+    "legacyCases": 267,
+    "retainedSelectors": 256,
+    "updatedSelectors": 4,
+    "retiredSelectors": 7,
+    "legacyArchive": "evidence/executions/history/91b0fcf006bfce29fa686891402af5ee71a23e91ba4ac356b41df8947e279212.json",
+    "invalidatedHarnessAttempt": "evidence/executions/history/8465d9959510799f28ee533ba524b62c4e4405a55172bcd8ea6ffab08b64a39b.json",
+    "meaning": "One intermediate attempt was invalidated by collector edits, with no failing product assertions; final groups were recollected under the fixed collector."
+  },
+  "scopePreservation": {
+    "checkedAt": "2026-10-23T13:59:22.212Z",
+    "baselineCommit": "37bdc7f7b6dc6e0fcc12b95de1dfa5251848b0b0",
+    "currentCommit": "37bdc7f7b6dc6e0fcc12b95de1dfa5251848b0b0",
+    "branch": "main",
+    "productFiles": 569,
+    "oldSnapshots": 5,
+    "changed": [],
+    "newProductFiles": [],
+    "noCommitReason": "Independent Atlas task; user requested preservation of existing product changes and did not request commit, push or publication."
+  },
+  "knownLimits": [
+    "53 current source reviews are explicitly partial/delta, not newly reread full text.",
+    "One repeated %s test declaration remains ambiguous and is not promoted to exact assertion coverage.",
+    "Core internal bytes, live provider, production host, OS sandbox and publication remain outside acceptance.",
+    "Source sampling is not continuous monitoring; broad dynamic test scopes remain conservative.",
+    "releaseScope indefinite waits, T1/T3 bounded syntax and cross-runtime digest fallback retain their documented limitations.",
+    "Browser current JSON is about 10 MB; graph engines and history remain on demand. Asset sizes do not claim loading times."
+  ],
+  "noCommitReason": "Independent Atlas task; user requested preservation of existing product changes and did not request commit, push or publication."
+}

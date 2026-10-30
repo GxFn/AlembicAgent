@@ -1,0 +1,56 @@
+{
+  "name": "alembic-agent-architecture-atlas",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Source-backed architecture atlas for AlembicAgent. Local documentation only.",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "collect": "node scripts/collect.mjs",
+    "predev": "npm run collect",
+    "dev": "vite --host 127.0.0.1",
+    "prebuild": "npm run collect",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "pretypecheck": "npm run collect",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src scripts test vite.config.ts vitest.config.ts",
+    "test": "node --test test/*.test.mjs && vitest run --config vitest.config.ts",
+    "check:structure": "node scripts/check-atlas.mjs",
+    "check:current": "node scripts/check-atlas.mjs --require-current",
+    "render:verify": "vite --host 127.0.0.1 --open /?verify=1",
+    "check:render": "node scripts/check-render.mjs",
+    "check:files": "node scripts/check-files.mjs",
+    "execution:verify": "node scripts/execution-results.mjs verify",
+    "execution:export": "node scripts/execution-results.mjs export",
+    "snapshot": "node scripts/snapshot.mjs",
+    "snapshot:verify": "node scripts/snapshot-storage.mjs verify",
+    "snapshot:migrate": "node scripts/snapshot-storage.mjs migrate",
+    "snapshot:restore": "node scripts/snapshot-storage.mjs restore",
+    "check": "npm run test && npm run typecheck && npm run lint && npm run check:files && npm run check:current && npm run check:render && npm run build",
+    "test:pilot": "vitest run --config vitest.config.ts test/pilot.test.ts",
+    "prerender:verify": "npm run collect",
+    "report:bundle": "node scripts/report-bundle.mjs",
+    "status": "node scripts/status.mjs",
+    "test:scoped": "node scripts/run-scoped.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "cytoscape": "3.34.2",
+    "dompurify": "3.4.17",
+    "elkjs": "0.12.0",
+    "marked": "18.0.11",
+    "mermaid": "12.2.0",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.6",
+    "@types/cytoscape": "3.21.9",
+    "@types/node": "22.19.18",
+    "typescript": "5.9.3",
+    "vite": "8.3.5",
+    "vitest": "4.1.12"
+  }
+}

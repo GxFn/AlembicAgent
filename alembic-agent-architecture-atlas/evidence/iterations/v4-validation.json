@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "iteration": 4,
+  "checkedAt": "2026-10-22T13:16:40.393Z",
+  "command": "npm run check",
+  "status": "pass",
+  "finalContentChecks": [
+    "npm run check:current",
+    "npm run check:render",
+    "npm run build"
+  ],
+  "node": "v24.19.0",
+  "tests": {
+    "parserAndEvidence": 22,
+    "readerLogicAndLoading": 9,
+    "realPilotScenarios": 6,
+    "total": 37
+  },
+  "scopedAgentTests": {
+    "report": "scoped-execution.json",
+    "newGroups": 39,
+    "newPassed": 240,
+    "retainedFromV3": 27,
+    "totalRecorded": 267,
+    "fullProductSuite": false,
+    "caseIdentity": "Each new executed case retains file-local collection index, full name and ancestor titles. Truncated parameter labels alone are not treated as unique IDs."
+  },
+  "sourceReview": {
+    "report": "reviews/source-depth-v4.json",
+    "fullSourceFiles": 293,
+    "newFullReadings": 18,
+    "priorPartial": 12,
+    "priorIndexed": 6,
+    "inheritedByteIdentical": 275,
+    "readingSections": 140,
+    "failureCompatibilityAndRecoveryEntries": 96,
+    "meaning": "Full source reading is distinct from test coverage. Supporting tests/config keep their actual partial/indexed status."
+  },
+  "typecheck": "pass",
+  "lint": "pass",
+  "sourceAndAnchors": "pass",
+  "browserRender": {
+    "status": "pass",
+    "diagrams": 88,
+    "receipt": "render/current.json",
+    "latestAttempt": "render/latest-attempt.json"
+  },
+  "build": "pass",
+  "browserQA": {
+    "schemaVersion": 1,
+    "checkedAt": "2026-10-22T13:16:40.392Z",
+    "checks": [
+      {
+        "name": "88 current Mermaid sources rendered to nonzero SVG; final changed outcome graph rerendered",
+        "result": "pass"
+      },
+      {
+        "name": "Runtime source modal is full/fresh in v4, partial/fresh in v3 with the same source hash",
+        "result": "pass"
+      },
+      {
+        "name": "Selecting v3 while reading a v4-only page shows missing document and preserves historical 27-case evidence",
+        "result": "pass"
+      },
+      {
+        "name": "Current/static build and v4 snapshot preserve 88 graphs and 267 recorded directed case executions",
+        "result": "pass"
+      },
+      {
+        "name": "Normal strategy result and signal/deadline appear as independent competitors in the outcome graph",
+        "result": "pass"
+      },
+      {
+        "name": "Runtime page, source modal and detector page work with responsive tables",
+        "result": "pass"
+      }
+    ],
+    "consoleErrorsInBuiltRegression": 0,
+    "narrowViewport": {
+      "requestedWidth": 390,
+      "contentWidth": 375,
+      "scrollWidth": 375,
+      "horizontalPageOverflow": false,
+      "tableViewportWidth": 335,
+      "maxTableScrollWidth": 440
+    },
+    "screenshots": [
+      "home-v4-1440.png",
+      "source-reading-v4-1440.png",
+      "runtime-outcomes-v4-1440.png",
+      "runtime-review-v4-1440.png",
+      "detector-review-v4-390.png"
+    ],
+    "notes": [
+      "Default viewport restored and owned temporary browser tabs closed.",
+      "Development and preview servers started for this iteration were stopped.",
+      "A development-data refresh closed an open source modal; the updated state was observed before further navigation."
+    ]
+  },
+  "bundleReport": "bundle-report.json",
+  "baselineCommit": "34c62eda7082732e7a6e8bc45fec4e2121c9653e",
+  "sourceInventoryFingerprint": "sha256:5f5cb1df8c5246d21354af46064dcb2ff31522405d313474d75b83652a069236",
+  "documents": 56,
+  "topics": 13,
+  "sourceFiles": 293,
+  "currentSnapshot": "agent-atlas-2026-10-22-v4",
+  "initialJavaScriptBytes": 117955,
+  "currentDataBytes": 2850482,
+  "productFilesCompared": 562,
+  "productFilesChangedDuringContinuation": 0,
+  "historicalSnapshotsPreserved": true,
+  "scopeEvidence": "iterations/v4-scope.json",
+  "implementationChanges": "Documentation, reading records and evidence only; atlas reader runtime and product runtime were not changed in v4.",
+  "knownProductBoundaries": [
+    "replyFn and releaseScope can wait outside the strategy deadline; permanent-pending scenarios were not newly injected.",
+    "Bridge HOST execution failure classification also covers post-envelope processing inside the same try.",
+    "Plain exec local killed/timeout facts may collapse to 137 and then error without an external aborted signal.",
+    "T1 grammar has explicit no-span cases; the detector is not a complete secret scanner."
+  ],
+  "warnings": [
+    "Mermaid/ELK chunks above 500 kB remain loaded on demand.",
+    "Current document JSON is about 2.85 MB, separately fetched; byte size is not measured load time.",
+    "26 unresolved module requests remain explicitly bounded."
+  ],
+  "notRun": [
+    "whole product test suite",
+    "live AI providers",
+    "production host and OS sandbox acceptance",
+    "Core build/test or internal acceptance",
+    "redaction-floor-performance full relative-baseline suite"
+  ],
+  "noCommitReason": "User requested source review and independent atlas updates; no commit, push or publication requested."
+}

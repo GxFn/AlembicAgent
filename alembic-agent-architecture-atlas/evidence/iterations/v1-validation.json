@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-10-22T11:07:27.940Z",
+  "command": "npm run check",
+  "status": "pass",
+  "node": "v24.19.0",
+  "tests": {
+    "parserAndEvidence": 9,
+    "readerLogic": 4,
+    "realPilotScenarios": 6,
+    "total": 19
+  },
+  "typecheck": "pass",
+  "lint": "pass",
+  "sourceAndAnchors": "pass",
+  "browserRender": {
+    "status": "pass",
+    "diagrams": 72,
+    "receipt": "render/current.json"
+  },
+  "build": "pass",
+  "browserQA": {
+    "schemaVersion": 1,
+    "checkedAt": "2026-10-22T11:04:28.069Z",
+    "environment": "Codex in-app Chromium browser; local loopback only",
+    "viewports": [
+      {
+        "requestedWidth": 1440,
+        "requestedHeight": 1000,
+        "artifact": "home-1440.png"
+      },
+      {
+        "requestedWidth": 768,
+        "requestedHeight": 1024,
+        "contentWidth": 753,
+        "horizontalOverflow": false,
+        "artifact": "home-768.png"
+      },
+      {
+        "requestedWidth": 390,
+        "requestedHeight": 844,
+        "contentWidth": 375,
+        "horizontalOverflow": false,
+        "artifact": "home-390.png"
+      }
+    ],
+    "checks": [
+      {
+        "name": "72 Mermaid SVG renders",
+        "result": "pass",
+        "evidence": "../render/current.json"
+      },
+      {
+        "name": "sequence fullscreen, zoom and accessible edge list",
+        "result": "pass"
+      },
+      {
+        "name": "E-SLICE-15 selection scrolls to its exact evidence row",
+        "result": "pass"
+      },
+      {
+        "name": "source path, symbol and byte-inherited reading detail",
+        "result": "pass"
+      },
+      {
+        "name": "symbol search and no-result state",
+        "result": "pass"
+      },
+      {
+        "name": "dependency direction, type-only and external package filters",
+        "result": "pass"
+      },
+      {
+        "name": "rapid layout switching and navigation after lifecycle repair",
+        "result": "pass",
+        "consoleErrorsSinceRegressionStart": 0
+      },
+      {
+        "name": "historical snapshot shows historical source and execution labels",
+        "result": "pass"
+      },
+      {
+        "name": "narrow-screen navigation and evidence availability",
+        "result": "pass"
+      },
+      {
+        "name": "Built dist served by vite preview: home, complete sequence and source states",
+        "result": "pass",
+        "consoleErrors": 0
+      }
+    ],
+    "repairedIssues": [
+      "ELK async completion must not update a destroyed Cytoscape canvas. Direct ELK calculation now checks active scope before applying coordinates.",
+      "Bundled ELK uses an in-process finite task; it has no native Worker terminate method. Canvas and ResizeObserver are released, late coordinates discarded."
+    ],
+    "scope": "Browser interaction and layout evidence only; product acceptance is outside this record."
+  },
+  "scope": "scope.json",
+  "baselineCommit": "34c62eda7082732e7a6e8bc45fec4e2121c9653e",
+  "sourceInventoryFingerprint": "sha256:5f5cb1df8c5246d21354af46064dcb2ff31522405d313474d75b83652a069236",
+  "documents": 46,
+  "topics": 13,
+  "sourceFiles": 293,
+  "inventoryFiles": 549,
+  "directImportEdges": 2195,
+  "aliasImportEdges": 220,
+  "currentSnapshot": "agent-atlas-2026-10-22-v1",
+  "immutableSnapshotOverwriteProbe": "rejected as expected",
+  "audit": {
+    "vulnerabilities": 0,
+    "note": "npm dependency audit during final isolated install"
+  },
+  "warnings": [
+    "Vite reports a large main chunk: the offline reader bundles complete current and historical inventories; local browser loading was verified.",
+    "26 unresolved module requests are listed explicitly; nonliteral imports and intentional fixture/dist boundaries are not inferred."
+  ],
+  "notRun": [
+    "whole product test suite",
+    "live AI providers",
+    "real terminal sandbox",
+    "production host entrypoints",
+    "Core durable end-to-end acceptance"
+  ],
+  "noCommitReason": "No commit, push or publication was requested."
+}
