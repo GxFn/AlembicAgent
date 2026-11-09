@@ -7,7 +7,7 @@ Alembic Agent 是 Alembic 的独立 Agent 运行时包:一个统一的 ReAct
 provider/transport 栈、以及契约优先的工具系统 —— 从 Alembic
 产品仓库中抽离,供宿主通过依赖注入嵌入使用。
 
-- **TypeScript + ESM(NodeNext),Node >= 22**,使用 Biome 统一格式化与 lint。
+- **TypeScript + ESM(NodeNext),Node.js >= 24.22.2**,使用 Biome 统一格式化与 lint。
 - 确定性能力(ProjectContext、知识持久化、维度配置、日志)**不在本仓实现**,
   一律通过 `@alembic/core` 包入口消费。
 

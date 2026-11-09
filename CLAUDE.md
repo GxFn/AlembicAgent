@@ -86,7 +86,7 @@
 
 ## 技术与代码规则
 
-- 默认技术栈：TypeScript、Node.js >= 22、ESM；如果项目初始化时选择其他技术栈，必须在本文档同步更新。
+- 默认技术栈：TypeScript、Node.js >= 24.22.2、ESM；如果项目初始化时选择其他技术栈，必须在本文档同步更新。
 - import 路径按当前 TypeScript/NodeNext 约定保持可构建；如果使用 ESM 编译到 Node，源码相对 import 通常需要 `.js` 后缀。
 - Lint / Format 优先与 Alembic 系列仓库保持一致，使用 Biome；不要无必要引入第二套格式化体系。
 - Tool schema 和 Agent contract 必须类型明确、版本清楚、可序列化、可回放。

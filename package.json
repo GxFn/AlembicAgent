@@ -95,7 +95,7 @@
     "README.zh-CN.md"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=24.22.2"
   },
   "scripts": {
     "build": "node scripts/build-agent.mjs",

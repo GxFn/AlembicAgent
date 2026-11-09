@@ -8,7 +8,7 @@ engine, an AI provider/transport stack covering five vendors, and a
 contract-first tool system — extracted from the Alembic product repository so
 hosts can embed it through dependency injection.
 
-- **TypeScript + ESM (NodeNext), Node >= 22**, formatted/linted with Biome.
+- **TypeScript + ESM (NodeNext), Node.js >= 24.22.2**, formatted/linted with Biome.
 - Deterministic capabilities (ProjectContext, knowledge persistence, dimension
   configs, logging) are **not** implemented here — they are consumed through
   the `@alembic/core` package entrypoints.

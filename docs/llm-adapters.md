@@ -124,7 +124,7 @@ schema 只验证输出结构，不替代 Strict 知识生产的证据、结束�
 
 ## 开发验证
 
-使用 Node 22+。Provider 测试采用真实 SDK + fake HTTP，运行不需要真实 API key。`test/ai-configuration.test.ts` 集中覆盖入口配置、容量提示、URL 规则、快照和回执兼容；原独立容量提示测试已合入此处。`test/openai-sdk.test.ts` 与 `test/native-provider-sdk.test.ts` 覆盖原生协议、错误/重试、embedding、私有字段回传及真实 Runtime 工具回合；`test/structured-output-validation.test.ts` 以同一合同矩阵覆盖各公开 structured 入口。
+使用 Node.js >= 24.22.2。Provider 测试采用真实 SDK + fake HTTP，运行不需要真实 API key。`test/ai-configuration.test.ts` 集中覆盖入口配置、容量提示、URL 规则、快照和回执兼容；原独立容量提示测试已合入此处。`test/openai-sdk.test.ts` 与 `test/native-provider-sdk.test.ts` 覆盖原生协议、错误/重试、embedding、私有字段回传及真实 Runtime 工具回合；`test/structured-output-validation.test.ts` 以同一合同矩阵覆盖各公开 structured 入口。
 
 `test/ai-provider-manager.test.ts` 通过公开 AI 入口覆盖热切换、补偿边界、观察者和计量绑定，并用真实 SDK + 延迟 HTTP fixture 验证切换后的旧请求归属。原 `ai-provider.test.ts` 的 Manager 用例已迁入，后者保留 Provider、模型策略和公共入口测试。
 
